@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Discover trusted apps, download them safely, or publish your own app to a growing community on Appora.">
+    <title>Appora | Discover. Download. Create.</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&amp;family=Plus+Jakarta+Sans:wght@600;700;800&amp;display=swap" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg fixed-top" aria-label="Main navigation">
+        <div class="container">
+            <a class="navbar-brand" href="#top" aria-label="Appora home">
+                <span class="brand-mark"><i class="bi bi-boxes"></i></span>
+                Appora
+            </a>
+            <button class="navbar-toggler border-0 shadow-none" type="button" data-bs-toggle="collapse" data-bs-target="#mainNav" aria-controls="mainNav" aria-expanded="false" aria-label="Toggle navigation">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="mainNav">
+                <ul class="navbar-nav mx-auto mb-2 mb-lg-0">
+                    <li class="nav-item"><a class="nav-link" href="#apps">Apps</a></li>
+                    <li class="nav-item"><a class="nav-link" href="#categories">Categories</a></li>
+                    <li class="nav-item"><a class="nav-link" href="#developers">For developers</a></li>
+                    <li class="nav-item"><a class="nav-link" href="#safety">Safety</a></li>
+                </ul>
+                <div class="d-flex gap-2 nav-actions">
+                    <div class="dropdown">
+                        <button class="btn btn-link text-dark text-decoration-none dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">Sign in</button>
+                        <ul class="dropdown-menu dropdown-menu-end auth-dropdown">
+                            <li><a class="dropdown-item" href="{{ url_for('main.account_login', role_name='user') }}"><i class="bi bi-person"></i><span><strong>User sign in</strong><small>Access your app library</small></span></a></li>
+                            <li><a class="dropdown-item" href="{{ url_for('main.account_login', role_name='developer') }}"><i class="bi bi-code-square"></i><span><strong>Developer sign in</strong><small>Manage published apps</small></span></a></li>
+                            <li><hr class="dropdown-divider"></li>
+                            <li><a class="dropdown-item" href="{{ url_for('main.admin_login') }}"><i class="bi bi-shield-lock"></i><span><strong>Admin sign in</strong><small>Review and manage</small></span></a></li>
+                        </ul>
+                    </div>
+                    <a class="btn btn-dark rounded-pill px-4" href="{{ url_for('main.create_account', role_name='developer') }}"><i class="bi bi-cloud-arrow-up me-2"></i>Upload an app</a>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <main id="top">
+        <section class="hero-section overflow-hidden">
+            <div class="hero-glow glow-one"></div>
+            <div class="hero-glow glow-two"></div>
+            <div class="container position-relative">
+                <div class="row align-items-center gy-5">
+                    <div class="col-lg-6">
+                        <div class="eyebrow mb-4"><span></span> Apps for every kind of day</div>
+                        <h1>Find your next <span>favorite app.</span></h1>
+                        <p class="hero-copy mt-4">Discover useful apps from talented developers, download with confidence, and keep everything you love in one place.</p>
+                        <form class="app-search mt-4" id="heroSearch" role="search">
+                            <i class="bi bi-search" aria-hidden="true"></i>
+                            <label class="visually-hidden" for="appSearchInput">Search apps</label>
+                            <input id="appSearchInput" type="search" placeholder="Search apps, games, and tools..." autocomplete="off">
+                            <button type="submit">Search</button>
+                        </form>
+                        <div class="popular-searches mt-3">
+                            <span>Popular:</span>
+                            <button type="button" data-search="productivity">Productivity</button>
+                            <button type="button" data-search="games">Games</button>
+                            <button type="button" data-search="design">Design</button>
+                        </div>
+                        <div class="hero-trust d-flex flex-wrap gap-4 mt-5">
+                            <span><i class="bi bi-shield-check"></i> Verified apps</span>
+                            <span><i class="bi bi-lightning-charge"></i> Fast downloads</span>
+                            <span><i class="bi bi-arrow-repeat"></i> Easy updates</span>
+                        </div>
+                    </div>
+                    <div class="col-lg-6">
+                        <div class="store-showcase">
+                            <div class="floating-note note-one"><i class="bi bi-stars"></i> Editor's choice</div>
+                            <div class="floating-note note-two"><i class="bi bi-download"></i> 10M+ downloads</div>
+                            <div class="store-window">
+                                <div class="store-window-head">
+                                    <span class="mini-brand"><i class="bi bi-boxes"></i></span>
+                                    <div class="mini-search"><i class="bi bi-search"></i> Search Appora</div>
+                                    <span class="mini-user">MS</span>
+                                </div>
+                                <div class="featured-banner">
+                                    <div>
+                                        <span class="banner-tag">APP OF THE DAY</span>
+                                        <h2>Make space<br>for big ideas.</h2>
+                                        <p>Planly · Productivity</p>
+                                        <button type="button">Get app</button>
+                                    </div>
+                                    <div class="banner-visual">
+                                        <span class="shape shape-one"></span>
+                                        <span class="shape shape-two"></span>
+                                        <span class="shape shape-three"><i class="bi bi-check2"></i></span>
+                                    </div>
+                                </div>
+                                <div class="store-row-head"><strong>Trending now</strong><span>See all</span></div>
+                                <div class="mini-app-row">
+                                    <div class="mini-app"><span class="app-icon icon-violet"><i class="bi bi-palette2"></i></span><strong>Frame</strong><small>Design</small><span class="rating"><i class="bi bi-star-fill"></i> 4.9</span></div>
+                                    <div class="mini-app"><span class="app-icon icon-green"><i class="bi bi-activity"></i></span><strong>Pulse</strong><small>Health</small><span class="rating"><i class="bi bi-star-fill"></i> 4.8</span></div>
+                                    <div class="mini-app"><span class="app-icon icon-orange"><i class="bi bi-controller"></i></span><strong>Drift</strong><small>Games</small><span class="rating"><i class="bi bi-star-fill"></i> 4.7</span></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="category-strip" id="categories">
+            <div class="container">
+                <div class="category-scroll">
+                    <a href="#apps" data-filter="productivity"><span class="category-icon purple"><i class="bi bi-kanban"></i></span>Productivity</a>
+                    <a href="#apps" data-filter="games"><span class="category-icon orange"><i class="bi bi-controller"></i></span>Games</a>
+                    <a href="#apps" data-filter="design"><span class="category-icon pink"><i class="bi bi-brush"></i></span>Design</a>
+                    <a href="#apps" data-filter="education"><span class="category-icon blue"><i class="bi bi-mortarboard"></i></span>Education</a>
+                    <a href="#apps" data-filter="health"><span class="category-icon green"><i class="bi bi-heart-pulse"></i></span>Health</a>
+                    <a href="#apps" data-filter="all"><span class="category-icon yellow"><i class="bi bi-grid"></i></span>View all</a>
+                </div>
+            </div>
+        </section>
+
+        <section class="section-space" id="apps">
+            <div class="container">
+                <div class="section-heading d-flex flex-column flex-md-row justify-content-between align-items-md-end gap-3">
+                    <div><span class="section-label">Hand-picked for you</span><h2 class="mt-2">Apps worth discovering</h2></div>
+                    <button class="view-all-button" type="button" data-filter="all">View all apps <i class="bi bi-arrow-right"></i></button>
+                </div>
+                <p class="search-feedback mt-4 mb-0" id="searchFeedback" aria-live="polite"></p>
+                <div class="row g-4 mt-2" id="appGrid">
+                    <div class="col-md-6 col-lg-4 app-item" data-name="Planly productivity planning tasks">
+                        <article class="app-card h-100">
+                            <div class="d-flex gap-3"><span class="large-app-icon icon-indigo"><i class="bi bi-check2-square"></i></span><div class="app-meta"><h3>Planly</h3><p>Work &amp; Productivity</p><span><i class="bi bi-star-fill"></i> 4.9 <small>· 1.2M downloads</small></span></div></div>
+                            <p class="app-description">A calm, flexible workspace for tasks, notes, and the projects that matter.</p>
+                            <div class="card-footer-row"><span class="verified"><i class="bi bi-patch-check-fill"></i> Verified</span><a href="#developers" class="download-button">Download <i class="bi bi-download"></i></a></div>
+                        </article>
+                    </div>
+                    <div class="col-md-6 col-lg-4 app-item" data-name="Frame design photo creative editor">
+                        <article class="app-card h-100">
+                            <div class="d-flex gap-3"><span class="large-app-icon icon-violet"><i class="bi bi-palette2"></i></span><div class="app-meta"><h3>Frame</h3><p>Design &amp; Creativity</p><span><i class="bi bi-star-fill"></i> 4.9 <small>· 860K downloads</small></span></div></div>
+                            <p class="app-description">Create polished visuals, quick edits, and beautiful social posts from anywhere.</p>
+                            <div class="card-footer-row"><span class="verified"><i class="bi bi-patch-check-fill"></i> Verified</span><a href="#developers" class="download-button">Download <i class="bi bi-download"></i></a></div>
+                        </article>
+                    </div>
+                    <div class="col-md-6 col-lg-4 app-item" data-name="Pulse health fitness habits wellness">
+                        <article class="app-card h-100">
+                            <div class="d-flex gap-3"><span class="large-app-icon icon-mint"><i class="bi bi-activity"></i></span><div class="app-meta"><h3>Pulse</h3><p>Health &amp; Fitness</p><span><i class="bi bi-star-fill"></i> 4.8 <small>· 2.4M downloads</small></span></div></div>
+                            <p class="app-description">Build better routines with simple movement, mindfulness, and sleep tracking.</p>
+                            <div class="card-footer-row"><span class="verified"><i class="bi bi-patch-check-fill"></i> Verified</span><a href="#developers" class="download-button">Download <i class="bi bi-download"></i></a></div>
+                        </article>
+                    </div>
+                    <div class="col-md-6 col-lg-4 app-item" data-name="Drift games racing multiplayer casual">
+                        <article class="app-card h-100">
+                            <div class="d-flex gap-3"><span class="large-app-icon icon-coral"><i class="bi bi-controller"></i></span><div class="app-meta"><h3>Drift</h3><p>Games</p><span><i class="bi bi-star-fill"></i> 4.7 <small>· 5.8M downloads</small></span></div></div>
+                            <p class="app-description">Quick races, bold tracks, and friendly competition whenever you need a break.</p>
+                            <div class="card-footer-row"><span class="verified"><i class="bi bi-patch-check-fill"></i> Verified</span><a href="#developers" class="download-button">Download <i class="bi bi-download"></i></a></div>
+                        </article>
+                    </div>
+                    <div class="col-md-6 col-lg-4 app-item" data-name="Lingua education languages learning study">
+                        <article class="app-card h-100">
+                            <div class="d-flex gap-3"><span class="large-app-icon icon-sky"><i class="bi bi-translate"></i></span><div class="app-meta"><h3>Lingua</h3><p>Education</p><span><i class="bi bi-star-fill"></i> 4.8 <small>· 980K downloads</small></span></div></div>
+                            <p class="app-description">Short, friendly lessons that make learning a new language feel natural.</p>
+                            <div class="card-footer-row"><span class="verified"><i class="bi bi-patch-check-fill"></i> Verified</span><a href="#developers" class="download-button">Download <i class="bi bi-download"></i></a></div>
+                        </article>
+                    </div>
+                    <div class="col-md-6 col-lg-4 app-item" data-name="Focusly productivity timer work study">
+                        <article class="app-card h-100">
+                            <div class="d-flex gap-3"><span class="large-app-icon icon-gold"><i class="bi bi-hourglass-split"></i></span><div class="app-meta"><h3>Focusly</h3><p>Productivity</p><span><i class="bi bi-star-fill"></i> 4.6 <small>· 540K downloads</small></span></div></div>
+                            <p class="app-description">A beautifully simple focus timer for deeper work and calmer study sessions.</p>
+                            <div class="card-footer-row"><span class="verified"><i class="bi bi-patch-check-fill"></i> Verified</span><a href="#developers" class="download-button">Download <i class="bi bi-download"></i></a></div>
+                        </article>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="safety-section section-space" id="safety">
+            <div class="container">
+                <div class="row align-items-center gy-5">
+                    <div class="col-lg-5">
+                        <span class="section-label light-label">Download with confidence</span>
+                        <h2 class="text-white mt-3">Safety comes standard.</h2>
+                        <p class="safety-copy mt-3">Every submitted app passes automated checks and human review before it reaches the store.</p>
+                        <a class="btn btn-light rounded-pill px-4 mt-3" href="#apps">Browse verified apps</a>
+                    </div>
+                    <div class="col-lg-7">
+                        <div class="row g-3">
+                            <div class="col-sm-6"><div class="safety-card"><i class="bi bi-shield-lock"></i><h3>Security reviewed</h3><p>Apps are scanned for unsafe files and suspicious behavior.</p></div></div>
+                            <div class="col-sm-6"><div class="safety-card"><i class="bi bi-person-check"></i><h3>Real developers</h3><p>Clear developer profiles help you know who built each app.</p></div></div>
+                            <div class="col-sm-6"><div class="safety-card"><i class="bi bi-arrow-repeat"></i><h3>Update alerts</h3><p>Always know when a safer or more capable version is ready.</p></div></div>
+                            <div class="col-sm-6"><div class="safety-card"><i class="bi bi-chat-heart"></i><h3>Community ratings</h3><p>Useful reviews from people who actually use the app.</p></div></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="section-space developer-section" id="developers">
+            <div class="container">
+                <div class="developer-panel">
+                    <div class="row align-items-center g-5">
+                        <div class="col-lg-6">
+                            <span class="section-label">Built something brilliant?</span>
+                            <h2 class="mt-3">Share your app with the world.</h2>
+                            <p class="section-copy mt-3">Create your developer profile, upload your build, and reach people searching for exactly what you made.</p>
+                            <div class="d-flex flex-column flex-sm-row gap-3 mt-4">
+                                <a class="btn btn-primary btn-lg rounded-pill px-4" href="{{ url_for('main.create_account', role_name='developer') }}"><i class="bi bi-cloud-arrow-up me-2"></i>Upload your app</a>
+                                <a class="btn btn-outline-dark btn-lg rounded-pill px-4" href="#upload-steps">Developer guide</a>
+                            </div>
+                        </div>
+                        <div class="col-lg-6" id="upload-steps">
+                            <div class="upload-flow">
+                                <div class="upload-step"><span>1</span><div><strong>Create your profile</strong><small>Tell users who you are and what you build.</small></div><i class="bi bi-person-plus"></i></div>
+                                <div class="flow-line"></div>
+                                <div class="upload-step"><span>2</span><div><strong>Upload your app</strong><small>Add the build, screenshots, and release notes.</small></div><i class="bi bi-cloud-arrow-up"></i></div>
+                                <div class="flow-line"></div>
+                                <div class="upload-step"><span>3</span><div><strong>Publish and grow</strong><small>Pass review, go live, and track downloads.</small></div><i class="bi bi-graph-up-arrow"></i></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="row text-center g-4 platform-stats">
+                    <div class="col-6 col-lg-3"><strong>12K+</strong><span>published apps</span></div>
+                    <div class="col-6 col-lg-3"><strong>4.8M</strong><span>monthly downloads</span></div>
+                    <div class="col-6 col-lg-3"><strong>8.5K</strong><span>active developers</span></div>
+                    <div class="col-6 col-lg-3"><strong>180+</strong><span>countries reached</span></div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <div class="container py-5">
+            <div class="row gy-4">
+                <div class="col-lg-5"><a class="navbar-brand" href="#top"><span class="brand-mark"><i class="bi bi-boxes"></i></span>Appora</a><p class="footer-copy mt-3">A welcoming place to discover, download, and share great apps.</p></div>
+                <div class="col-6 col-lg"><h3>Discover</h3><a href="#apps">Featured apps</a><a href="#categories">Categories</a><a href="#safety">App safety</a></div>
+                <div class="col-6 col-lg"><h3>Developers</h3><a href="#developers">Upload an app</a><a href="#upload-steps">Publishing guide</a><a href="#developers">Developer tools</a></div>
+                <div class="col-6 col-lg"><h3>Company</h3><a href="#top">About Appora</a><a href="#top">Support</a><a href="#top">Contact</a></div>
+            </div>
+            <div class="footer-bottom d-flex flex-column flex-md-row justify-content-between gap-2"><span>© 2026 Appora. All rights reserved.</span><span>Made for apps and the people behind them.</span></div>
+        </div>
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        const appItems = [...document.querySelectorAll('.app-item')];
+        const searchInput = document.getElementById('appSearchInput');
+        const feedback = document.getElementById('searchFeedback');
+
+        function filterApps(term) {
+            const query = term.trim().toLowerCase();
+            let visible = 0;
+            appItems.forEach((item) => {
+                const matches = !query || item.dataset.name.toLowerCase().includes(query);
+                item.classList.toggle('d-none', !matches);
+                if (matches) visible += 1;
+            });
+            feedback.textContent = query ? `${visible} app${visible === 1 ? '' : 's'} found for “${term}”` : '';
+            document.getElementById('apps').scrollIntoView({ behavior: 'smooth' });
+        }
+
+        document.getElementById('heroSearch').addEventListener('submit', (event) => {
+            event.preventDefault();
+            filterApps(searchInput.value);
+        });
+
+        document.querySelectorAll('[data-search], [data-filter]').forEach((button) => {
+            button.addEventListener('click', () => {
+                const term = button.dataset.search || button.dataset.filter;
+                searchInput.value = term === 'all' ? '' : term;
+                filterApps(term === 'all' ? '' : term);
+            });
+        });
+    </script>
+</body>
+</html>

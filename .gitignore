@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.packages/
+.venv/
+env/
+instance/
+*.db
+.env

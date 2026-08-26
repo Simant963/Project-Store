@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Sign in to your Appora {{ account_role.value }} account.">
+    <title>{{ account_role.value|title }} sign in | Appora</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&amp;family=Plus+Jakarta+Sans:wght@600;700;800&amp;display=swap" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+{% set is_admin = account_role.value == 'admin' %}
+{% set is_developer = account_role.value == 'developer' %}
+{% set login_action = url_for('main.admin_login') if is_admin else url_for('main.account_login', role_name=account_role.value) %}
+<body class="login-page">
+    <main class="login-shell">
+        <section class="login-aside {{ 'developer-aside' if is_developer else '' }}" aria-label="Appora {{ account_role.value }} sign in">
+            <a class="navbar-brand login-brand" href="{{ url_for('main.home') }}">
+                <span class="brand-mark"><i class="bi bi-boxes"></i></span>Appora
+            </a>
+            <div class="login-aside-copy">
+                <span class="admin-pill">
+                    <i class="bi {{ 'bi-shield-lock-fill' if is_admin else ('bi-code-square' if is_developer else 'bi-person-heart') }}"></i>
+                    {{ 'Admin portal' if is_admin else ('Developer studio' if is_developer else 'Your Appora') }}
+                </span>
+                <h1>{{ 'Keep the marketplace trusted.' if is_admin else ('Build it. Ship it. Grow it.' if is_developer else 'Your apps, all in one place.') }}</h1>
+                <p>{{ 'Review submissions, manage accounts, and help every Appora download stay safe.' if is_admin else ('Manage releases, follow your review status, and understand how people discover your apps.' if is_developer else 'Return to your downloads, saved apps, reviews, and personalized discoveries.') }}</p>
+                <div class="moderation-card">
+                    {% if is_admin %}
+                        <div class="moderation-card-head"><span><i class="bi bi-stars"></i> Review center</span><span class="status-dot">Live</span></div>
+                        <div class="review-app-row"><span class="review-app-icon"><i class="bi bi-cloud-sun"></i></span><div><strong>Weatherly 2.4</strong><small>New release submitted</small></div><span class="review-badge">In review</span></div>
+                        <div class="review-progress"><span></span></div>
+                        <div class="review-checks"><span><i class="bi bi-check-circle-fill"></i> Malware scan</span><span><i class="bi bi-check-circle-fill"></i> Developer verified</span><span><i class="bi bi-hourglass-split"></i> Content review</span></div>
+                    {% elif is_developer %}
+                        <div class="studio-preview-head"><span>Release overview</span><span>This month</span></div>
+                        <div class="studio-metric"><div><small>Total downloads</small><strong>24,892</strong></div><span><i class="bi bi-arrow-up"></i> 18.4%</span></div>
+                        <div class="studio-bars"><i style="height: 32%"></i><i style="height: 48%"></i><i style="height: 43%"></i><i style="height: 70%"></i><i style="height: 62%"></i><i style="height: 88%"></i><i style="height: 78%"></i></div>
+                    {% else %}
+                        <div class="library-preview-head"><span>Your library</span><span>12 apps</span></div>
+                        <div class="library-app"><span class="app-icon icon-violet"><i class="bi bi-palette2"></i></span><div><strong>Frame</strong><small>Update available</small></div><button type="button">Update</button></div>
+                        <div class="library-app"><span class="app-icon icon-green"><i class="bi bi-activity"></i></span><div><strong>Pulse</strong><small>Up to date</small></div><i class="bi bi-check-circle-fill"></i></div>
+                    {% endif %}
+                </div>
+            </div>
+            <p class="login-aside-footer"><i class="bi bi-lock"></i> Protected {{ account_role.value }} access</p>
+        </section>
+
+        <section class="login-form-side">
+            <div class="login-form-wrap">
+                <a class="back-link" href="{{ url_for('main.home') }}"><i class="bi bi-arrow-left"></i> Back to Appora</a>
+                <div class="login-heading">
+                    <span class="mobile-admin-icon"><i class="bi {{ 'bi-shield-lock' if is_admin else ('bi-code-square' if is_developer else 'bi-person') }}"></i></span>
+                    <h2>Welcome back</h2>
+                    <p>Sign in to your {{ account_role.value }} account.</p>
+                </div>
+
+                {% with messages = get_flashed_messages(with_categories=true) %}
+                    {% if messages %}
+                        {% for category, message in messages %}
+                            <div class="login-alert {{ category }}" role="alert"><i class="bi {{ 'bi-check-circle-fill' if category == 'success' else ('bi-hourglass-split' if category == 'warning' else 'bi-exclamation-circle-fill') }}"></i>{{ message }}</div>
+                        {% endfor %}
+                    {% endif %}
+                {% endwith %}
+
+                <form method="post" action="{{ login_action }}" class="login-form">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <div class="form-group">
+                        <label for="identifier">Email or username</label>
+                        <div class="field-wrap"><i class="bi bi-person"></i><input id="identifier" name="identifier" type="text" placeholder="Enter your email or username" required autofocus autocomplete="username"></div>
+                    </div>
+                    <div class="form-group">
+                        <div class="d-flex justify-content-between align-items-center"><label for="password">Password</label><span class="reset-help">Keep your password private</span></div>
+                        <div class="field-wrap"><i class="bi bi-key"></i><input id="password" name="password" type="password" placeholder="Enter your password" required autocomplete="current-password"><button class="password-toggle" type="button" id="passwordToggle" aria-label="Show password"><i class="bi bi-eye"></i></button></div>
+                    </div>
+                    <label class="remember-row"><input type="checkbox" name="remember"><span>Keep me signed in on this device</span></label>
+                    <button class="admin-login-button" type="submit">Sign in <i class="bi bi-arrow-right"></i></button>
+                </form>
+
+                {% if not is_admin %}
+                    <p class="auth-switch">New to Appora? <a href="{{ url_for('main.create_account', role_name=account_role.value) }}">Create a {{ account_role.value }} account</a></p>
+                    <p class="role-switch">{{ 'Looking for your personal apps?' if is_developer else 'Publishing your own apps?' }} <a href="{{ url_for('main.account_login', role_name='user' if is_developer else 'developer') }}">{{ 'User sign in' if is_developer else 'Developer sign in' }}</a></p>
+                {% else %}
+                    <p class="access-note"><i class="bi bi-info-circle"></i> This area is restricted to authorized Appora administrators.</p>
+                {% endif %}
+            </div>
+        </section>
+    </main>
+    <script>
+        const passwordInput = document.getElementById('password');
+        const passwordToggle = document.getElementById('passwordToggle');
+        passwordToggle.addEventListener('click', () => {
+            const showing = passwordInput.type === 'text';
+            passwordInput.type = showing ? 'password' : 'text';
+            passwordToggle.innerHTML = `<i class="bi ${showing ? 'bi-eye' : 'bi-eye-slash'}"></i>`;
+            passwordToggle.setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
+        });
+    </script>
+</body>
+</html>
