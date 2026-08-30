@@ -1,19 +1,35 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
-    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Developer studio | Appora</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&amp;family=Plus+Jakarta+Sans:wght@600;700;800&amp;display=swap" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"><link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-</head>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Developer studio | Appora</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&amp;family=Plus+Jakarta+Sans:wght@600;700;800&amp;display=swap" rel="stylesheet"><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"><link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet"><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"></head>
 <body class="member-dashboard developer-dashboard">
-    <nav class="member-nav"><div class="container d-flex justify-content-between align-items-center"><a class="navbar-brand" href="{{ url_for('main.home') }}"><span class="brand-mark"><i class="bi bi-boxes"></i></span>Appora <small>Studio</small></a><div class="member-nav-links"><a href="{{ url_for('main.home') }}">Marketplace</a><a class="active" href="#">My apps</a><span class="member-avatar developer">{{ user.initials }}</span><form method="post" action="{{ url_for('main.logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit" title="Sign out"><i class="bi bi-box-arrow-right"></i></button></form></div></div></nav>
+    <nav class="member-nav"><div class="container d-flex justify-content-between align-items-center"><a class="navbar-brand" href="{{ url_for('main.home') }}"><span class="brand-mark"><i class="bi bi-boxes"></i></span>Appora <small>Studio</small></a><div class="member-nav-links"><a href="{{ url_for('main.app_marketplace') }}">Marketplace</a><a class="active" href="{{ url_for('main.developer_dashboard') }}">My apps</a><a href="{{ url_for('main.developer_verification') }}">Verification</a><span class="member-avatar developer">{{ user.initials }}</span><form method="post" action="{{ url_for('main.logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit" title="Sign out"><i class="bi bi-box-arrow-right"></i></button></form></div></div></nav>
     <main class="container member-main">
-        <section class="member-hero"><div><span class="section-label">Developer studio</span><h1>{{ user.company_name or user.username }}</h1><p>Your account is approved. You can now prepare your first Appora release.</p></div><button class="btn btn-primary rounded-pill px-4" type="button"><i class="bi bi-cloud-arrow-up me-2"></i>Upload new app</button></section>
-        <section class="member-stat-grid"><article><span class="member-stat-icon purple"><i class="bi bi-box-seam"></i></span><div><strong>0</strong><small>Published apps</small></div></article><article><span class="member-stat-icon green"><i class="bi bi-download"></i></span><div><strong>0</strong><small>Total downloads</small></div></article><article><span class="member-stat-icon orange"><i class="bi bi-star"></i></span><div><strong>—</strong><small>Average rating</small></div></article></section>
-        <section class="empty-library developer-empty"><span><i class="bi bi-window-plus"></i></span><h2>Publish your first app</h2><p>Add your build, app details, screenshots, and release notes. Your submission will go through marketplace review.</p><button class="btn btn-dark rounded-pill px-4" type="button">Start an app submission</button></section>
+        {% with messages = get_flashed_messages(with_categories=true) %}{% for category, message in messages %}<div class="dashboard-alert {{ category }}"><i class="bi {{ 'bi-check-circle-fill' if category == 'success' else 'bi-exclamation-circle-fill' }}"></i>{{ message }}</div>{% endfor %}{% endwith %}
+        <section class="member-hero"><div><span class="section-label">Developer studio</span><h1>{{ user.company_name or user.username }}</h1><p>Your verified publisher workspace for Android releases.</p></div><a class="btn btn-primary rounded-pill px-4" href="{{ url_for('main.submit_app') }}"><i class="bi bi-cloud-arrow-up me-2"></i>Upload new app</a></section>
+        <section class="member-stat-grid"><article><span class="member-stat-icon purple"><i class="bi bi-box-seam"></i></span><div><strong>{{ app_counts.published }}</strong><small>Published apps</small></div></article><article><span class="member-stat-icon green"><i class="bi bi-download"></i></span><div><strong>{{ app_counts.downloads }}</strong><small>Total downloads</small></div></article><article><span class="member-stat-icon orange"><i class="bi bi-hourglass-split"></i></span><div><strong>{{ app_counts.pending }}</strong><small>Pending review</small></div></article></section>
+        {% if apps %}
+        <section class="developer-app-panel">
+            <div class="developer-panel-heading"><div><h2>Your apps</h2><p>Approval and download changes appear here automatically.</p></div><span class="live-connection online"><i></i><span>Live</span></span></div>
+            <div class="developer-app-list">
+                {% for app in apps %}<article>
+                    <img src="{{ url_for('main.app_icon', app_id=app.id) }}" alt="">
+                    <div class="developer-app-name"><strong>{{ app.name }}</strong><small>{{ app.package_name }} · v{{ app.version }}</small></div>
+                    <span class="status-chip {{ app.status.value }}"><i></i>{{ app.status_label }}</span>
+                    <span class="developer-downloads"><i class="bi bi-download"></i>{{ app.download_count }}</span>
+                    <span class="developer-submitted">{{ app.submitted_at.strftime('%d %b %Y') }}</span>
+                    {% if app.status.value == 'approved' %}
+                        <div class="developer-row-actions">
+                            <a class="review-button" href="{{ url_for('main.app_detail', slug=app.slug) }}">Store <i class="bi bi-arrow-up-right"></i></a>
+                            {% if app.pending_release_status and app.pending_release_status.value == 'pending' %}<span class="release-wait">v{{ app.pending_version }} in review</span>
+                            {% elif app.pending_release_status and app.pending_release_status.value == 'rejected' %}<a class="review-button resubmit" href="{{ url_for('main.submit_app_version', app_id=app.id) }}">Fix v{{ app.pending_version }}</a>
+                            {% else %}<a class="review-button release" href="{{ url_for('main.submit_app_version', app_id=app.id) }}">New version <i class="bi bi-plus"></i></a>{% endif %}
+                        </div>
+                    {% elif app.status.value == 'rejected' %}<a class="review-button resubmit" href="{{ url_for('main.submit_app', app_id=app.id) }}">Fix &amp; resubmit <i class="bi bi-pencil-square"></i></a>
+                    {% else %}<span class="review-wait">{{ app.review_note or 'Waiting for review' }}</span>{% endif %}
+                </article>{% endfor %}
+            </div>
+        </section>
+        {% else %}<section class="empty-library developer-empty"><span><i class="bi bi-window-plus"></i></span><h2>Publish your first app</h2><p>Add your store details, app icon, release information, privacy link, and APK. The administrator reviews everything before it goes live.</p><a class="btn btn-dark rounded-pill px-4" href="{{ url_for('main.submit_app') }}">Start an app submission</a></section>{% endif %}
     </main>
-</body>
-</html>
+    <script>const accountStream=new EventSource('{{ url_for("main.my_account_events") }}');accountStream.addEventListener('account-change',(event)=>{const update=JSON.parse(event.data);if(['blocked','rejected','deleted'].includes(update.status))window.location.assign(`{{ url_for('main.account_access_changed') }}?state=${encodeURIComponent(update.status)}`)});const appStream=new EventSource('{{ url_for("main.developer_app_events") }}');appStream.addEventListener('account-change',()=>window.location.reload());</script>
+</body></html>

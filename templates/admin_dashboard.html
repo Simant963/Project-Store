@@ -21,7 +21,7 @@
             <a href="{{ url_for('main.admin_dashboard', status='pending') }}"><i class="bi bi-person-check"></i>Approvals{% if counts.pending %}<span>{{ counts.pending }}</span>{% endif %}</a>
             <a href="{{ url_for('main.admin_dashboard', role='user') }}"><i class="bi bi-people"></i>Users</a>
             <a href="{{ url_for('main.admin_dashboard', role='developer') }}"><i class="bi bi-code-square"></i>Developers</a>
-            <a href="#"><i class="bi bi-box-seam"></i>Apps<small>Next</small></a>
+            <a href="{{ url_for('main.admin_apps') }}"><i class="bi bi-box-seam"></i>Apps</a>
             <a href="#"><i class="bi bi-chat-square-text"></i>Reports<small>Next</small></a>
         </nav>
         <span class="sidebar-label">Marketplace</span>
@@ -40,7 +40,7 @@
         <header class="admin-topbar">
             <button class="sidebar-toggle" type="button" id="sidebarToggle" aria-label="Open navigation"><i class="bi bi-list"></i></button>
             <div><p>Admin console</p><h1>Good to see you, {{ admin.username }}.</h1></div>
-            <div class="topbar-actions"><a href="{{ url_for('main.home') }}" class="topbar-store-link"><i class="bi bi-box-arrow-up-right"></i><span>Open store</span></a><span class="admin-avatar">{{ admin.initials }}</span></div>
+            <div class="topbar-actions"><span class="live-connection" id="liveConnection"><i></i><span>Connecting</span></span><a href="{{ url_for('main.home') }}" class="topbar-store-link"><i class="bi bi-box-arrow-up-right"></i><span>Open store</span></a><span class="admin-avatar">{{ admin.initials }}</span></div>
         </header>
 
         {% with messages = get_flashed_messages(with_categories=true) %}
@@ -79,6 +79,7 @@
                                 <td><span class="joined-date">{{ account.created_at.strftime('%d %b %Y') if account.created_at else '—' }}</span></td>
                                 <td>
                                     <div class="account-actions">
+                                        {% if account.role.value == 'developer' %}<a class="action-button details" href="{{ url_for('main.admin_developer_review', user_id=account.id) }}" title="Review identity"><i class="bi bi-person-vcard"></i><span>Details</span></a>{% endif %}
                                         {% if account.status.value in ['pending', 'rejected'] %}<form method="post" action="{{ url_for('main.manage_account', user_id=account.id, action='approve') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="action-button approve" type="submit" title="Approve"><i class="bi bi-check-lg"></i><span>Approve</span></button></form>{% endif %}
                                         {% if account.status.value == 'pending' %}<form method="post" action="{{ url_for('main.manage_account', user_id=account.id, action='reject') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="action-button reject" type="submit" title="Reject"><i class="bi bi-x-lg"></i><span>Reject</span></button></form>{% endif %}
                                         {% if account.status.value == 'blocked' %}<form method="post" action="{{ url_for('main.manage_account', user_id=account.id, action='unblock') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="action-button unblock" type="submit" title="Unblock"><i class="bi bi-unlock"></i><span>Unblock</span></button></form>{% elif account.status.value != 'rejected' %}<form method="post" action="{{ url_for('main.manage_account', user_id=account.id, action='block') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="action-button block" type="submit" title="Block"><i class="bi bi-slash-circle"></i><span>Block</span></button></form>{% endif %}
@@ -95,17 +96,82 @@
         </section>
     </main>
     <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
+    <div class="live-toast" id="liveToast" role="status" aria-live="polite"></div>
     <script>
         const sidebar = document.getElementById('adminSidebar');
         const backdrop = document.getElementById('sidebarBackdrop');
+        const liveConnection = document.getElementById('liveConnection');
+        const liveToast = document.getElementById('liveToast');
         const toggleSidebar = () => { sidebar.classList.toggle('open'); backdrop.classList.toggle('show'); };
         document.getElementById('sidebarToggle').addEventListener('click', toggleSidebar);
         backdrop.addEventListener('click', toggleSidebar);
-        document.querySelectorAll('[data-delete-account]').forEach((form) => {
-            form.addEventListener('submit', (event) => {
-                if (!window.confirm(`Permanently delete ${form.dataset.deleteAccount}? This cannot be undone.`)) event.preventDefault();
+
+        function showLiveToast(message) {
+            liveToast.textContent = message;
+            liveToast.classList.add('show');
+            window.setTimeout(() => liveToast.classList.remove('show'), 2600);
+        }
+
+        function bindAccountActions() {
+            document.querySelectorAll('.account-actions form').forEach((form) => {
+                if (form.dataset.liveBound) return;
+                form.dataset.liveBound = 'true';
+                form.addEventListener('submit', async (event) => {
+                    event.preventDefault();
+                    if (form.dataset.deleteAccount && !window.confirm(`Permanently delete ${form.dataset.deleteAccount}? This cannot be undone.`)) return;
+                    const button = form.querySelector('button');
+                    button.disabled = true;
+                    try {
+                        const response = await fetch(form.action, {
+                            method: 'POST',
+                            body: new FormData(form),
+                            headers: { 'X-Requested-With': 'fetch', 'Accept': 'application/json' }
+                        });
+                        if (!response.ok) throw new Error('Update failed');
+                        const result = await response.json();
+                        showLiveToast(result.message);
+                        window.setTimeout(refreshDashboard, 200);
+                    } catch (error) {
+                        button.disabled = false;
+                        showLiveToast('Could not update the account. Please try again.');
+                    }
+                });
             });
+        }
+
+        let refreshInProgress = false;
+        async function refreshDashboard() {
+            if (refreshInProgress) return;
+            refreshInProgress = true;
+            try {
+                const response = await fetch(window.location.href, { headers: { 'X-Live-Refresh': 'true' } });
+                if (!response.ok) throw new Error('Refresh failed');
+                const nextPage = new DOMParser().parseFromString(await response.text(), 'text/html');
+                const currentStats = document.querySelector('.admin-stats');
+                const currentPanel = document.querySelector('.management-panel');
+                const nextStats = nextPage.querySelector('.admin-stats');
+                const nextPanel = nextPage.querySelector('.management-panel');
+                if (currentStats && currentPanel && nextStats && nextPanel) {
+                    currentStats.replaceWith(nextStats);
+                    currentPanel.replaceWith(nextPanel);
+                    bindAccountActions();
+                }
+            } finally {
+                refreshInProgress = false;
+            }
+        }
+
+        bindAccountActions();
+        const accountStream = new EventSource('{{ url_for("main.admin_account_events") }}');
+        accountStream.addEventListener('open', () => {
+            liveConnection.classList.add('online');
+            liveConnection.querySelector('span').textContent = 'Live';
         });
+        accountStream.addEventListener('error', () => {
+            liveConnection.classList.remove('online');
+            liveConnection.querySelector('span').textContent = 'Reconnecting';
+        });
+        accountStream.addEventListener('account-change', refreshDashboard);
     </script>
 </body>
 </html>

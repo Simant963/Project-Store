@@ -16,11 +16,11 @@
         <a class="navbar-brand" href="{{ url_for('main.home') }}"><span class="brand-mark"><i class="bi bi-boxes"></i></span>Appora</a>
         {% if account.status.value == 'pending' %}
             <span class="created-icon pending"><i class="bi bi-hourglass-split"></i></span>
-            <p class="section-label">Application received</p>
-            <h1>Your developer account is in review.</h1>
-            <p>Thanks, {{ account.username }}. An administrator must approve your account before you can sign in and publish apps.</p>
-            <div class="created-status"><span>1<small>Account created</small></span><i class="bi bi-arrow-right"></i><span class="current">2<small>Admin review</small></span><i class="bi bi-arrow-right"></i><span>3<small>Start publishing</small></span></div>
-            <a class="btn btn-primary btn-lg rounded-pill px-4" href="{{ url_for('main.account_login', role_name='developer') }}">Go to developer sign in</a>
+            <p class="section-label">Account created</p>
+            <h1>One more step, {{ account.username }}.</h1>
+            <p>Sign in to add your legal details and government ID photo. An administrator reviews them before app uploads are unlocked.</p>
+            <div class="created-status"><span>1<small>Account created</small></span><i class="bi bi-arrow-right"></i><span class="current">2<small>Identity details</small></span><i class="bi bi-arrow-right"></i><span>3<small>Admin approval</small></span></div>
+            <a class="btn btn-primary btn-lg rounded-pill px-4" href="{{ url_for('main.account_login', role_name='developer') }}">Continue verification <i class="bi bi-arrow-right ms-2"></i></a>
         {% else %}
             <span class="created-icon"><i class="bi bi-check2"></i></span>
             <p class="section-label">You are ready</p>

@@ -57,7 +57,7 @@
                 <form method="post" action="{{ url_for('main.create_account', role_name=account_role.value) }}" class="register-form">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                     <div class="register-grid">
-                        <div class="form-group"><label for="username">Username</label><div class="field-wrap"><i class="bi bi-at"></i><input id="username" name="username" type="text" value="{{ form_values.username }}" placeholder="e.g. alexbuilds" required autocomplete="username"></div></div>
+                        <div class="form-group"><label for="username">Username</label><div class="field-wrap" id="usernameField"><i class="bi bi-at"></i><input id="username" name="username" type="text" value="{{ form_values.username }}" placeholder="e.g. alexbuilds" required autocomplete="username" minlength="3" maxlength="30" pattern="[A-Za-z0-9_]+"><span class="username-state-icon" id="usernameStateIcon"></span></div><small class="username-availability" id="usernameAvailability" aria-live="polite">Use 3–30 letters, numbers, or underscores.</small></div>
                         <div class="form-group"><label for="email">Email address</label><div class="field-wrap"><i class="bi bi-envelope"></i><input id="email" name="email" type="email" value="{{ form_values.email }}" placeholder="you@example.com" required autocomplete="email"></div></div>
                     </div>
                     {% if is_developer %}
@@ -67,7 +67,7 @@
                         <div class="form-group"><label for="password">Password</label><div class="field-wrap"><i class="bi bi-key"></i><input id="password" name="password" type="password" placeholder="8+ characters" required autocomplete="new-password"><button class="password-toggle" type="button" data-toggle-password="password" aria-label="Show password"><i class="bi bi-eye"></i></button></div></div>
                         <div class="form-group"><label for="confirm_password">Confirm password</label><div class="field-wrap"><i class="bi bi-shield-check"></i><input id="confirm_password" name="confirm_password" type="password" placeholder="Repeat password" required autocomplete="new-password"><button class="password-toggle" type="button" data-toggle-password="confirm_password" aria-label="Show password"><i class="bi bi-eye"></i></button></div></div>
                     </div>
-                    {% if is_developer %}<div class="approval-notice"><i class="bi bi-hourglass-split"></i><div><strong>Administrator approval required</strong><span>Your developer account will remain pending until an admin reviews it.</span></div></div>{% endif %}
+                    {% if is_developer %}<div class="approval-notice"><i class="bi bi-person-vcard"></i><div><strong>Identity verification required</strong><span>After sign-up, add your legal details and government ID for administrator approval.</span></div></div>{% endif %}
                     <label class="terms-row"><input type="checkbox" required><span>I agree to the Appora terms and community guidelines.</span></label>
                     <button class="admin-login-button" type="submit">Create {{ account_role.value }} account <i class="bi bi-arrow-right"></i></button>
                 </form>
@@ -76,6 +76,57 @@
         </section>
     </main>
     <script>
+        const usernameInput = document.getElementById('username');
+        const usernameField = document.getElementById('usernameField');
+        const usernameMessage = document.getElementById('usernameAvailability');
+        const usernameIcon = document.getElementById('usernameStateIcon');
+        let usernameTimer;
+        let usernameRequest;
+
+        function showUsernameState(state, message, icon = '') {
+            usernameField.dataset.availability = state;
+            usernameMessage.className = `username-availability ${state}`;
+            usernameMessage.textContent = message;
+            usernameIcon.innerHTML = icon ? `<i class="bi ${icon}"></i>` : '';
+        }
+
+        async function checkUsername() {
+            const username = usernameInput.value.trim();
+            if (!/^[A-Za-z0-9_]{3,30}$/.test(username)) {
+                usernameInput.setCustomValidity(username ? 'Use 3–30 letters, numbers, or underscores.' : '');
+                showUsernameState('neutral', 'Use 3–30 letters, numbers, or underscores.');
+                return;
+            }
+
+            usernameRequest?.abort();
+            usernameRequest = new AbortController();
+            showUsernameState('checking', 'Checking username availability…', 'bi-arrow-repeat');
+            try {
+                const response = await fetch(`{{ url_for('main.username_availability') }}?username=${encodeURIComponent(username)}`, { signal: usernameRequest.signal });
+                if (!response.ok) throw new Error('Availability check failed');
+                const result = await response.json();
+                if (result.available) {
+                    usernameInput.setCustomValidity('');
+                    showUsernameState('available', `@${username} is available`, 'bi-check-circle-fill');
+                } else {
+                    usernameInput.setCustomValidity('That username is already taken.');
+                    showUsernameState('taken', `@${username} is already taken`, 'bi-x-circle-fill');
+                }
+            } catch (error) {
+                if (error.name !== 'AbortError') {
+                    usernameInput.setCustomValidity('');
+                    showUsernameState('neutral', 'Availability will be checked when you submit.');
+                }
+            }
+        }
+
+        usernameInput.addEventListener('input', () => {
+            clearTimeout(usernameTimer);
+            showUsernameState('checking', 'Checking username availability…', 'bi-arrow-repeat');
+            usernameTimer = setTimeout(checkUsername, 350);
+        });
+        if (usernameInput.value.trim()) checkUsername();
+
         document.querySelectorAll('[data-toggle-password]').forEach((button) => {
             button.addEventListener('click', () => {
                 const input = document.getElementById(button.dataset.togglePassword);

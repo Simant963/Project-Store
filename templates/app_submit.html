@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ 'Resubmit ' ~ app_record.name if app_record else 'Submit an app' }} | Appora Studio</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&amp;family=Plus+Jakarta+Sans:wght@600;700;800&amp;display=swap" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"><link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="submission-page">
+    <nav class="member-nav"><div class="container d-flex justify-content-between align-items-center"><a class="navbar-brand" href="{{ url_for('main.developer_dashboard') }}"><span class="brand-mark"><i class="bi bi-boxes"></i></span>Appora <small>Studio</small></a><div class="member-nav-links"><a href="{{ url_for('main.app_marketplace') }}">Marketplace</a><a class="active" href="{{ url_for('main.developer_dashboard') }}">My apps</a><span class="member-avatar developer">{{ user.initials }}</span><form method="post" action="{{ url_for('main.logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit" title="Sign out"><i class="bi bi-box-arrow-right"></i></button></form></div></div></nav>
+    <main class="container submission-shell">
+        {% with messages = get_flashed_messages(with_categories=true) %}{% for category, message in messages %}<div class="dashboard-alert {{ category }}"><i class="bi bi-exclamation-circle-fill"></i>{{ message }}</div>{% endfor %}{% endwith %}
+        <header class="submission-heading"><div><span class="section-label">{{ 'Rejected submission' if app_record else 'New app release' }}</span><h1>{{ 'Fix and resubmit your app.' if app_record else 'Submit your Android app.' }}</h1><p>{{ 'Update the details requested by the administrator. You may keep the existing icon and APK or replace them.' if app_record else 'Add the store information and signed APK. Nothing becomes public until an administrator approves it.' }}</p></div><a class="back-link" href="{{ url_for('main.developer_dashboard') }}"><i class="bi bi-arrow-left"></i> My apps</a></header>
+        {% if app_record and app_record.review_note %}<div class="review-note"><strong><i class="bi bi-chat-left-text me-2"></i>Administrator feedback</strong><p>{{ app_record.review_note }}</p></div>{% endif %}
+        <form class="submission-card" method="post" enctype="multipart/form-data">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="form-section-title"><span>1</span><div><h2>Store listing</h2><p>This is what people will see before downloading.</p></div></div>
+            <div class="row g-4">
+                <div class="col-md-7"><label for="name">App name</label><input id="name" name="name" value="{{ form_values.name }}" minlength="2" maxlength="120" required placeholder="My brilliant app"></div>
+                <div class="col-md-5"><label for="category">Category</label><select id="category" name="category" required><option value="">Choose a category</option>{% for category in categories %}<option value="{{ category.value }}" {{ 'selected' if form_values.category == category.value else '' }}>{{ category.value|title }}</option>{% endfor %}</select></div>
+                <div class="col-12"><label for="short_description">Short description <small>20–180 characters</small></label><input id="short_description" name="short_description" value="{{ form_values.short_description }}" minlength="20" maxlength="180" required placeholder="A clear one-line summary of what your app does"></div>
+                <div class="col-12"><label for="description">Full description <small>At least 80 characters</small></label><textarea id="description" name="description" minlength="80" rows="7" required placeholder="Explain the main features, benefits, and who the app is for.">{{ form_values.description }}</textarea></div>
+                <div class="col-md-6"><label for="app_icon">App icon</label><label class="upload-field compact" for="app_icon"><i class="bi bi-image"></i><span><strong>{{ 'Replace icon' if app_record else 'Upload icon' }}</strong><small id="iconFileName">{{ 'Current icon will be kept if empty' if app_record else 'JPG, PNG, or WebP · max 5 MB' }}</small></span><em>Browse</em></label><input class="visually-hidden" id="app_icon" name="app_icon" type="file" accept="image/jpeg,image/png,image/webp" {{ '' if app_record else 'required' }}></div>
+                <div class="col-md-6"><label for="age_rating">Age rating</label><select id="age_rating" name="age_rating" required><option value="">Choose a rating</option>{% for rating in age_ratings %}<option value="{{ rating.value }}" {{ 'selected' if form_values.age_rating == rating.value else '' }}>{{ rating.value|title }}</option>{% endfor %}</select></div>
+                <div class="col-12"><label for="screenshots">App screenshots <small>Optional · up to 8 images</small></label><label class="upload-field screenshots" for="screenshots"><i class="bi bi-images"></i><span><strong>{{ 'Replace screenshots' if app_record and app_record.screenshots else 'Add screenshots' }}</strong><small id="screenshotFileNames">{% if app_record and app_record.screenshots %}{{ app_record.screenshots|length }} current screenshot{{ '' if app_record.screenshots|length == 1 else 's' }} will be kept if empty{% else %}Show the main screens and features · JPG, PNG, or WebP{% endif %}</small></span><em>Choose images</em></label><input class="visually-hidden" id="screenshots" name="screenshots" type="file" accept="image/jpeg,image/png,image/webp" multiple>{% if app_record and app_record.screenshots %}<div class="existing-screenshot-strip">{% for screenshot in app_record.screenshots %}<img src="{{ url_for('main.app_screenshot', screenshot_id=screenshot.id) }}" alt="Existing screenshot {{ loop.index }}">{% endfor %}</div>{% endif %}</div>
+            </div>
+            <div class="form-section-title mt-5"><span>2</span><div><h2>Android release</h2><p>Upload the build and version information.</p></div></div>
+            <div class="row g-4">
+                <div class="col-md-6"><label for="package_name">Package name</label><input id="package_name" name="package_name" value="{{ form_values.package_name }}" maxlength="180" required placeholder="com.company.appname"><small class="field-hint">Package names cannot be reused.</small></div>
+                <div class="col-md-3"><label for="version">Version</label><input id="version" name="version" value="{{ form_values.version }}" maxlength="40" required placeholder="1.0.0"></div>
+                <div class="col-md-3"><label for="min_android_version">Minimum Android</label><input id="min_android_version" name="min_android_version" value="{{ form_values.min_android_version }}" maxlength="40" required placeholder="Android 8.0"></div>
+                <div class="col-12"><label class="upload-field apk" for="apk_file"><i class="bi bi-file-earmark-zip"></i><span><strong>{{ 'Replace APK file' if app_record else 'Upload APK file' }}</strong><small id="apkFileName">{{ app_record.apk_original_name ~ ' will be kept if empty' if app_record else 'Android .apk · max 200 MB' }}</small></span><em>Choose APK</em></label><input class="visually-hidden" id="apk_file" name="apk_file" type="file" accept=".apk,application/vnd.android.package-archive" {{ '' if app_record else 'required' }}></div>
+                <div class="col-12"><label for="changelog">What is new? <small>Optional</small></label><textarea id="changelog" name="changelog" rows="4" placeholder="Features, improvements, and fixes in this version.">{{ form_values.changelog }}</textarea></div>
+            </div>
+            <div class="form-section-title mt-5"><span>3</span><div><h2>Support and privacy</h2><p>Give users a trusted way to contact you and understand data use.</p></div></div>
+            <div class="row g-4">
+                <div class="col-md-6"><label for="support_email">Support email</label><input id="support_email" name="support_email" type="email" value="{{ form_values.support_email or user.email }}" maxlength="120" required></div>
+                <div class="col-md-6"><label for="website">App website <small>Optional</small></label><input id="website" name="website" type="url" value="{{ form_values.website }}" maxlength="255" placeholder="https://example.com"></div>
+                <div class="col-12"><label for="privacy_policy_url">Privacy-policy URL</label><input id="privacy_policy_url" name="privacy_policy_url" type="url" value="{{ form_values.privacy_policy_url }}" maxlength="255" required placeholder="https://example.com/privacy"></div>
+            </div>
+            <div class="privacy-callout"><i class="bi bi-shield-check"></i><div><strong>Safety checks and administrator review</strong><p>The APK archive, Android manifest, internal paths, compression, and duplicate hash are checked before submission. This does not replace malware scanning.</p></div></div>
+            <div class="submission-actions"><a href="{{ url_for('main.developer_dashboard') }}">Save nothing and leave</a><button class="btn btn-primary btn-lg rounded-pill px-4" type="submit">{{ 'Resubmit for review' if app_record else 'Submit app for review' }} <i class="bi bi-cloud-arrow-up ms-2"></i></button></div>
+        </form>
+    </main>
+    <script>
+        [['app_icon','iconFileName'],['apk_file','apkFileName']].forEach(([inputId,labelId]) => { const input = document.getElementById(inputId); input.addEventListener('change', () => { document.getElementById(labelId).textContent = input.files[0]?.name || 'Choose a file'; }); });
+        const screenshots = document.getElementById('screenshots');
+        screenshots.addEventListener('change', () => { const count = screenshots.files.length; document.getElementById('screenshotFileNames').textContent = count ? `${count} screenshot${count === 1 ? '' : 's'} selected` : 'Choose up to 8 images'; });
+    </script>
+</body>
+</html>

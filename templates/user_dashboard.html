@@ -15,5 +15,14 @@
         <section class="member-stat-grid"><article><span class="member-stat-icon purple"><i class="bi bi-grid"></i></span><div><strong>0</strong><small>Apps in library</small></div></article><article><span class="member-stat-icon green"><i class="bi bi-download"></i></span><div><strong>0</strong><small>Total downloads</small></div></article><article><span class="member-stat-icon orange"><i class="bi bi-star"></i></span><div><strong>0</strong><small>Your reviews</small></div></article></section>
         <section class="empty-library"><span><i class="bi bi-cloud-arrow-down"></i></span><h2>Your library is ready</h2><p>Apps you download will appear here with updates and quick access.</p><a class="btn btn-dark rounded-pill px-4" href="{{ url_for('main.home') }}#apps">Browse featured apps</a></section>
     </main>
+    <script>
+        const accountStream = new EventSource('{{ url_for("main.my_account_events") }}');
+        accountStream.addEventListener('account-change', (event) => {
+            const update = JSON.parse(event.data);
+            if (['blocked', 'rejected', 'deleted'].includes(update.status)) {
+                window.location.assign(`{{ url_for('main.account_access_changed') }}?state=${encodeURIComponent(update.status)}`);
+            }
+        });
+    </script>
 </body>
 </html>

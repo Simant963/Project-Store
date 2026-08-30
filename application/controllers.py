@@ -1,28 +1,49 @@
 import json
+import hashlib
 import re
 import secrets
+import zipfile
 from datetime import datetime, timezone
 from functools import wraps
+from pathlib import Path, PurePosixPath
 from queue import Empty
+from urllib.parse import urlparse
 
 from flask import (
     Blueprint,
     Response,
     abort,
+    current_app,
     flash,
     jsonify,
     redirect,
     render_template,
     request,
     session,
+    send_file,
     stream_with_context,
     url_for,
 )
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
+from werkzeug.utils import secure_filename
 
 from .database import db
-from .models import AccountStatus, User, UserRole
+from .models import (
+    AccountStatus,
+    AgeRating,
+    AppCategory,
+    AppStatus,
+    AppScreenshot,
+    AppVersionHistory,
+    DeveloperProfile,
+    GovernmentIdType,
+    ReleaseStatus,
+    SecurityScanStatus,
+    StoreApp,
+    User,
+    UserRole,
+)
 from .realtime import account_events
 from .username_linked_list import username_index
 
@@ -90,6 +111,242 @@ def role_required(required_role):
     return decorator
 
 
+def developer_access_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        user = current_user()
+        if (
+            user is None
+            or user.role != UserRole.DEVELOPER
+            or user.status == AccountStatus.BLOCKED
+        ):
+            session.clear()
+            flash("Please sign in with your developer account to continue.", "error")
+            return redirect(url_for("main.account_login", role_name="developer"))
+        return view(user, *args, **kwargs)
+
+    return wrapped
+
+
+def private_upload_folder(folder):
+    root = Path(current_app.config["PRIVATE_UPLOAD_ROOT"]).resolve()
+    target = (root / folder).resolve()
+    if target.parent != root:
+        raise ValueError("Invalid upload folder")
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def safe_delete_upload(folder, filename):
+    if not filename or Path(filename).name != filename:
+        return
+    directory = private_upload_folder(folder)
+    target = (directory / filename).resolve()
+    if target.parent == directory and target.is_file():
+        target.unlink()
+
+
+def upload_size(file_storage):
+    file_storage.stream.seek(0, 2)
+    size = file_storage.stream.tell()
+    file_storage.stream.seek(0)
+    return size
+
+
+def detect_image_extension(file_storage):
+    header = file_storage.stream.read(16)
+    file_storage.stream.seek(0)
+    if header.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def save_image_upload(file_storage, folder, maximum_bytes):
+    if not file_storage or not file_storage.filename:
+        raise ValueError("Choose an image to upload.")
+    size = upload_size(file_storage)
+    if size <= 0 or size > maximum_bytes:
+        raise ValueError(f"Image must be smaller than {maximum_bytes // (1024 * 1024)} MB.")
+    extension = detect_image_extension(file_storage)
+    if extension is None:
+        raise ValueError("Upload a JPG, PNG, or WebP image.")
+
+    stored_name = f"{secrets.token_hex(20)}{extension}"
+    target = private_upload_folder(folder) / stored_name
+    file_storage.save(target)
+    original_name = secure_filename(file_storage.filename) or f"upload{extension}"
+    return stored_name, original_name, size
+
+
+def save_apk_upload(file_storage):
+    if not file_storage or not file_storage.filename:
+        raise ValueError("Choose an APK file to upload.")
+    original_name = secure_filename(file_storage.filename)
+    if not original_name.lower().endswith(".apk"):
+        raise ValueError("The application file must use the .apk extension.")
+    size = upload_size(file_storage)
+    maximum_bytes = current_app.config["APK_MAX_BYTES"]
+    if size <= 0 or size > maximum_bytes:
+        raise ValueError(f"APK must be smaller than {maximum_bytes // (1024 * 1024)} MB.")
+    signature = file_storage.stream.read(4)
+    file_storage.stream.seek(0)
+    if signature not in {b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"}:
+        raise ValueError("The uploaded file is not a valid APK archive.")
+
+    stored_name = f"{secrets.token_hex(24)}.apk"
+    target = private_upload_folder("apks") / stored_name
+    try:
+        file_storage.save(target)
+        scan_summary = inspect_apk_archive(target)
+        digest = hashlib.sha256()
+        with target.open("rb") as apk_file:
+            for chunk in iter(lambda: apk_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except Exception:
+        if target.is_file():
+            target.unlink()
+        raise
+    return stored_name, original_name, size, digest.hexdigest(), scan_summary
+
+
+def inspect_apk_archive(path):
+    """Perform bounded structural checks without claiming malware detection."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            entries = archive.infolist()
+            if not entries:
+                raise ValueError("The APK archive is empty.")
+            if len(entries) > 20000:
+                raise ValueError("The APK contains too many files to review safely.")
+
+            total_compressed = 0
+            total_uncompressed = 0
+            names = set()
+            dex_files = 0
+            native_libraries = 0
+            for entry in entries:
+                name = entry.filename
+                normalized = PurePosixPath(name)
+                if (
+                    not name
+                    or "\\" in name
+                    or name.startswith("/")
+                    or ".." in normalized.parts
+                    or (normalized.parts and ":" in normalized.parts[0])
+                ):
+                    raise ValueError("The APK contains an unsafe file path.")
+                if entry.flag_bits & 0x1:
+                    raise ValueError("Encrypted APK entries cannot be reviewed safely.")
+                if entry.file_size > 512 * 1024 * 1024:
+                    raise ValueError("The APK contains an unexpectedly large internal file.")
+                names.add(name.rstrip("/"))
+                total_compressed += entry.compress_size
+                total_uncompressed += entry.file_size
+                lowered = name.casefold()
+                if re.fullmatch(r"classes\d*\.dex", lowered):
+                    dex_files += 1
+                if lowered.startswith("lib/") and lowered.endswith(".so"):
+                    native_libraries += 1
+
+            if "AndroidManifest.xml" not in names:
+                raise ValueError("The APK is missing AndroidManifest.xml.")
+            if total_uncompressed > 1536 * 1024 * 1024:
+                raise ValueError("The APK expands beyond the safe review limit.")
+            compression_ratio = total_uncompressed / max(total_compressed, 1)
+            if total_uncompressed > 100 * 1024 * 1024 and compression_ratio > 200:
+                raise ValueError("The APK has an unsafe compression ratio.")
+
+            manifest = archive.getinfo("AndroidManifest.xml")
+            if manifest.file_size <= 0 or manifest.file_size > 20 * 1024 * 1024:
+                raise ValueError("The Android manifest has an invalid size.")
+            with archive.open(manifest) as manifest_file:
+                manifest_file.read(min(manifest.file_size, 64))
+    except zipfile.BadZipFile as error:
+        raise ValueError("The uploaded file is not a readable APK archive.") from error
+
+    components = []
+    if dex_files:
+        components.append(f"{dex_files} DEX file{'s' if dex_files != 1 else ''}")
+    if native_libraries:
+        components.append(
+            f"{native_libraries} native librar{'ies' if native_libraries != 1 else 'y'}"
+        )
+    component_text = " · ".join(components) if components else "resource-only package"
+    return (
+        f"Archive structure passed · Android manifest found · {len(entries)} files checked "
+        f"· {component_text}"
+    )
+
+
+def duplicate_apk_exists(digest, exclude_app_id=None, allow_pending_app_id=None):
+    current_query = StoreApp.query.filter(StoreApp.apk_sha256 == digest)
+    if exclude_app_id is not None:
+        current_query = current_query.filter(StoreApp.id != exclude_app_id)
+    if current_query.first():
+        return True
+
+    pending_query = StoreApp.query.filter(StoreApp.pending_apk_sha256 == digest)
+    excluded_pending_ids = {
+        value for value in (exclude_app_id, allow_pending_app_id) if value is not None
+    }
+    if excluded_pending_ids:
+        pending_query = pending_query.filter(~StoreApp.id.in_(excluded_pending_ids))
+    if pending_query.first():
+        return True
+
+    history_query = AppVersionHistory.query.filter(AppVersionHistory.apk_sha256 == digest)
+    if exclude_app_id is not None:
+        history_query = history_query.filter(AppVersionHistory.app_id != exclude_app_id)
+    return history_query.first() is not None
+
+
+def is_valid_web_url(value, required=False):
+    if not value:
+        return not required
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def unique_app_slug(name):
+    base = re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-") or "app"
+    slug = base
+    while StoreApp.query.filter_by(slug=slug).first():
+        slug = f"{base}-{secrets.token_hex(3)}"
+    return slug
+
+
+def send_private_upload(folder, filename, download_name=None, as_attachment=False):
+    if not filename or Path(filename).name != filename:
+        abort(404)
+    path = (private_upload_folder(folder) / filename).resolve()
+    if path.parent != private_upload_folder(folder) or not path.is_file():
+        abort(404)
+    response = send_file(
+        path,
+        as_attachment=as_attachment,
+        download_name=download_name,
+        conditional=True,
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    if not as_attachment:
+        response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
+def remove_app_files(app_record):
+    safe_delete_upload("app_icons", app_record.icon_file)
+    safe_delete_upload("apks", app_record.apk_file)
+    safe_delete_upload("apks", app_record.pending_apk_file)
+    for screenshot in app_record.screenshots:
+        safe_delete_upload("app_screenshots", screenshot.file_name)
+    for history in app_record.version_history:
+        safe_delete_upload("apks", history.apk_file)
+
+
 def validate_registration(form, role):
     username = form.get("username", "").strip()
     email = form.get("email", "").strip().lower()
@@ -126,7 +383,13 @@ def validate_registration(form, role):
 
 @main.route("/")
 def home():
-    return render_template("home.html")
+    approved_apps = (
+        StoreApp.query.filter_by(status=AppStatus.APPROVED)
+        .order_by(StoreApp.approved_at.desc(), StoreApp.id.desc())
+        .limit(6)
+        .all()
+    )
+    return render_template("home.html", approved_apps=approved_apps)
 
 
 @main.get("/api/usernames/availability")
@@ -187,8 +450,14 @@ def account_login(role_name):
         return redirect(url_for("main.admin_login"))
 
     signed_in = current_user()
-    if signed_in and signed_in.role == role and signed_in.status == AccountStatus.APPROVED:
-        return redirect(dashboard_url_for(signed_in))
+    if signed_in and signed_in.role == role:
+        if signed_in.status == AccountStatus.APPROVED:
+            return redirect(dashboard_url_for(signed_in))
+        if role == UserRole.DEVELOPER and signed_in.status in {
+            AccountStatus.PENDING,
+            AccountStatus.REJECTED,
+        }:
+            return redirect(url_for("main.developer_verification"))
 
     if request.method == "POST":
         if not valid_csrf_token():
@@ -207,12 +476,18 @@ def account_login(role_name):
 
         if not user or not user.check_password(password):
             flash("Incorrect email, username, or password.", "error")
-        elif user.status == AccountStatus.PENDING:
-            flash("Your developer account is waiting for administrator approval.", "warning")
-        elif user.status == AccountStatus.REJECTED:
-            flash("This account request was not approved. Contact the marketplace administrator.", "error")
         elif user.status == AccountStatus.BLOCKED:
             flash("This account has been blocked. Contact the marketplace administrator.", "error")
+        elif role == UserRole.DEVELOPER and user.status in {
+            AccountStatus.PENDING,
+            AccountStatus.REJECTED,
+        }:
+            sign_in_user(user, request.form.get("remember") == "on")
+            return redirect(url_for("main.developer_verification"))
+        elif user.status == AccountStatus.PENDING:
+            flash("This account is waiting for administrator approval.", "warning")
+        elif user.status == AccountStatus.REJECTED:
+            flash("This account request was not approved. Contact the marketplace administrator.", "error")
         else:
             sign_in_user(user, request.form.get("remember") == "on")
             return redirect(dashboard_url_for(user))
@@ -306,6 +581,606 @@ def create_account(role_name):
     )
 
 
+@main.route("/developer/verification", methods=["GET", "POST"])
+@developer_access_required
+def developer_verification(user):
+    profile = user.developer_profile
+    if profile is None:
+        profile = DeveloperProfile(user=user)
+        db.session.add(profile)
+
+    if request.method == "POST":
+        if not valid_csrf_token():
+            flash("Your session expired. Please try again.", "error")
+            return redirect(url_for("main.developer_verification"))
+
+        legal_name = request.form.get("legal_name", "").strip()
+        phone = request.form.get("phone", "").strip()
+        country = request.form.get("country", "").strip()
+        website = request.form.get("website", "").strip()
+        id_number = request.form.get("government_id_number", "").strip()
+        try:
+            id_type = GovernmentIdType(request.form.get("government_id_type", ""))
+        except ValueError:
+            id_type = None
+
+        errors = []
+        if len(legal_name) < 3:
+            errors.append("Enter your full legal name.")
+        if not re.fullmatch(r"[+0-9][0-9()\-\s]{6,24}", phone):
+            errors.append("Enter a valid phone number.")
+        if len(country) < 2:
+            errors.append("Enter your country.")
+        if id_type is None:
+            errors.append("Choose a government ID type.")
+        if len(id_number) < 4:
+            errors.append("Enter the government ID number.")
+        if website and not is_valid_web_url(website):
+            errors.append("Website must start with http:// or https://.")
+
+        id_upload = request.files.get("government_id_photo")
+        new_id_file = None
+        new_id_original = None
+        if not errors and id_upload and id_upload.filename:
+            try:
+                new_id_file, new_id_original, _ = save_image_upload(
+                    id_upload,
+                    "developer_ids",
+                    current_app.config["DEVELOPER_ID_MAX_BYTES"],
+                )
+            except ValueError as error:
+                errors.append(str(error))
+        elif not profile.government_id_file:
+            errors.append("Upload a clear photo of your government ID.")
+
+        if errors:
+            for error in errors:
+                flash(error, "error")
+        else:
+            old_id_file = profile.government_id_file
+            profile.legal_name = legal_name
+            profile.phone = phone
+            profile.country = country
+            profile.website = website or None
+            profile.government_id_type = id_type
+            profile.government_id_number = id_number
+            if new_id_file:
+                profile.government_id_file = new_id_file
+                profile.government_id_original_name = new_id_original
+            profile.submitted_at = datetime.now(timezone.utc)
+            profile.reviewed_at = None
+            profile.review_note = None
+            user.status = AccountStatus.PENDING
+            user.approved_at = None
+            db.session.commit()
+            if new_id_file and old_id_file and old_id_file != new_id_file:
+                safe_delete_upload("developer_ids", old_id_file)
+            account_events.publish(
+                {
+                    "type": "account_updated",
+                    "action": "verification_submitted",
+                    "user_id": user.id,
+                    "username": user.username,
+                    "role": user.role.value,
+                    "status": user.status.value,
+                }
+            )
+            flash("Your verification details were sent for administrator review.", "success")
+            return redirect(url_for("main.developer_verification"))
+
+    return render_template(
+        "developer_verification.html",
+        user=user,
+        profile=profile,
+        id_types=GovernmentIdType,
+        csrf_token=get_csrf_token(),
+    )
+
+
+@main.route("/developer/apps/new", methods=["GET", "POST"])
+@main.route("/developer/apps/<int:app_id>/edit", methods=["GET", "POST"])
+@developer_access_required
+def submit_app(user, app_id=None):
+    if user.status != AccountStatus.APPROVED:
+        flash("Administrator approval is required before you can upload an app.", "warning")
+        return redirect(url_for("main.developer_verification"))
+    if not user.developer_profile or not user.developer_profile.is_submitted:
+        flash("Complete developer verification before uploading an app.", "error")
+        return redirect(url_for("main.developer_verification"))
+
+    app_record = None
+    if app_id is not None:
+        app_record = db.session.get(StoreApp, app_id)
+        if app_record is None or app_record.developer_id != user.id:
+            abort(404)
+        if app_record.status != AppStatus.REJECTED:
+            flash("Only rejected submissions can be edited and resubmitted.", "warning")
+            return redirect(url_for("main.developer_dashboard"))
+
+    field_names = (
+        "name",
+        "package_name",
+        "short_description",
+        "description",
+        "version",
+        "min_android_version",
+        "category",
+        "age_rating",
+        "website",
+        "support_email",
+        "privacy_policy_url",
+        "changelog",
+    )
+    if request.method == "POST":
+        form_values = {key: request.form.get(key, "") for key in field_names}
+    elif app_record:
+        form_values = {
+            "name": app_record.name,
+            "package_name": app_record.package_name,
+            "short_description": app_record.short_description,
+            "description": app_record.description,
+            "version": app_record.version,
+            "min_android_version": app_record.min_android_version,
+            "category": app_record.category.value,
+            "age_rating": app_record.age_rating.value,
+            "website": app_record.website or "",
+            "support_email": app_record.support_email,
+            "privacy_policy_url": app_record.privacy_policy_url,
+            "changelog": app_record.changelog or "",
+        }
+    else:
+        form_values = {key: "" for key in field_names}
+
+    if request.method == "POST":
+        if not valid_csrf_token():
+            flash("Your session expired. Please try again.", "error")
+            return redirect(url_for("main.submit_app"))
+
+        name = form_values["name"].strip()
+        package_name = form_values["package_name"].strip()
+        short_description = form_values["short_description"].strip()
+        description = form_values["description"].strip()
+        version = form_values["version"].strip()
+        min_android_version = form_values["min_android_version"].strip()
+        support_email = form_values["support_email"].strip().lower()
+        privacy_policy_url = form_values["privacy_policy_url"].strip()
+        website = form_values["website"].strip()
+        try:
+            category = AppCategory(form_values["category"])
+        except ValueError:
+            category = None
+        try:
+            age_rating = AgeRating(form_values["age_rating"])
+        except ValueError:
+            age_rating = None
+
+        errors = []
+        if not 2 <= len(name) <= 120:
+            errors.append("App name must be between 2 and 120 characters.")
+        package_conflict = None
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+", package_name):
+            errors.append("Enter a valid package name such as com.example.myapp.")
+        else:
+            package_query = StoreApp.query.filter(
+                func.lower(StoreApp.package_name) == package_name.lower()
+            )
+            if app_record:
+                package_query = package_query.filter(StoreApp.id != app_record.id)
+            package_conflict = package_query.first()
+        if package_conflict:
+            errors.append("That package name is already registered.")
+        if not 20 <= len(short_description) <= 180:
+            errors.append("Short description must be between 20 and 180 characters.")
+        if len(description) < 80:
+            errors.append("Full description must contain at least 80 characters.")
+        if not version or len(version) > 40:
+            errors.append("Enter a valid version.")
+        if not min_android_version or len(min_android_version) > 40:
+            errors.append("Enter the minimum Android version.")
+        if category is None:
+            errors.append("Choose an app category.")
+        if age_rating is None:
+            errors.append("Choose an age rating.")
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", support_email):
+            errors.append("Enter a valid support email.")
+        if not is_valid_web_url(privacy_policy_url, required=True):
+            errors.append("Enter a valid privacy-policy URL beginning with http:// or https://.")
+        if website and not is_valid_web_url(website):
+            errors.append("App website must begin with http:// or https://.")
+
+        icon_file = None
+        apk_file = None
+        apk_original = None
+        apk_size = None
+        apk_sha256 = None
+        apk_scan_summary = None
+        apk_scan_status = None
+        apk_scanned_at = None
+        new_screenshots = []
+        screenshot_uploads = [
+            upload
+            for upload in request.files.getlist("screenshots")
+            if upload and upload.filename
+        ]
+        if len(screenshot_uploads) > 8:
+            errors.append("Upload no more than 8 screenshots.")
+        if not errors:
+            try:
+                icon_upload = request.files.get("app_icon")
+                apk_upload = request.files.get("apk_file")
+                if icon_upload and icon_upload.filename:
+                    icon_file, _, _ = save_image_upload(
+                        icon_upload,
+                        "app_icons",
+                        current_app.config["APP_ICON_MAX_BYTES"],
+                    )
+                elif app_record:
+                    icon_file = app_record.icon_file
+                else:
+                    raise ValueError("Choose an app icon to upload.")
+                if apk_upload and apk_upload.filename:
+                    (
+                        apk_file,
+                        apk_original,
+                        apk_size,
+                        apk_sha256,
+                        apk_scan_summary,
+                    ) = save_apk_upload(apk_upload)
+                    if duplicate_apk_exists(
+                        apk_sha256,
+                        exclude_app_id=app_record.id if app_record else None,
+                    ):
+                        raise ValueError(
+                            "This exact APK build is already registered in the marketplace."
+                        )
+                    apk_scan_status = SecurityScanStatus.PASSED
+                    apk_scanned_at = datetime.now(timezone.utc)
+                elif app_record:
+                    apk_file = app_record.apk_file
+                    apk_original = app_record.apk_original_name
+                    apk_size = app_record.apk_size
+                    apk_sha256 = app_record.apk_sha256
+                    apk_scan_summary = app_record.security_scan_summary
+                    apk_scan_status = app_record.security_scan_status
+                    apk_scanned_at = app_record.security_scanned_at
+                else:
+                    raise ValueError("Choose an APK file to upload.")
+                for position, screenshot_upload in enumerate(screenshot_uploads):
+                    stored_name, original_name, _ = save_image_upload(
+                        screenshot_upload,
+                        "app_screenshots",
+                        current_app.config["APP_SCREENSHOT_MAX_BYTES"],
+                    )
+                    new_screenshots.append(
+                        {
+                            "file_name": stored_name,
+                            "original_name": original_name,
+                            "position": position,
+                        }
+                    )
+            except ValueError as error:
+                errors.append(str(error))
+                if icon_file and (not app_record or icon_file != app_record.icon_file):
+                    safe_delete_upload("app_icons", icon_file)
+                if apk_file and (not app_record or apk_file != app_record.apk_file):
+                    safe_delete_upload("apks", apk_file)
+                for screenshot in new_screenshots:
+                    safe_delete_upload("app_screenshots", screenshot["file_name"])
+                new_screenshots = []
+
+        if errors:
+            for error in errors:
+                flash(error, "error")
+        else:
+            old_icon_file = app_record.icon_file if app_record else None
+            old_apk_file = app_record.apk_file if app_record else None
+            old_screenshot_files = (
+                [screenshot.file_name for screenshot in app_record.screenshots]
+                if app_record and new_screenshots
+                else []
+            )
+            if app_record is None:
+                app_record = StoreApp(developer=user, slug=unique_app_slug(name))
+                db.session.add(app_record)
+            app_record.name = name
+            app_record.package_name = package_name
+            app_record.short_description = short_description
+            app_record.description = description
+            app_record.version = version
+            app_record.min_android_version = min_android_version
+            app_record.category = category
+            app_record.age_rating = age_rating
+            app_record.website = website or None
+            app_record.support_email = support_email
+            app_record.privacy_policy_url = privacy_policy_url
+            app_record.changelog = form_values["changelog"].strip() or None
+            app_record.icon_file = icon_file
+            app_record.apk_file = apk_file
+            app_record.apk_original_name = apk_original
+            app_record.apk_size = apk_size
+            app_record.apk_sha256 = apk_sha256
+            app_record.security_scan_status = apk_scan_status
+            app_record.security_scan_summary = apk_scan_summary
+            app_record.security_scanned_at = apk_scanned_at
+            app_record.status = AppStatus.PENDING
+            app_record.review_note = None
+            app_record.submitted_at = datetime.now(timezone.utc)
+            app_record.approved_at = None
+            if new_screenshots:
+                app_record.screenshots.clear()
+                app_record.screenshots.extend(
+                    AppScreenshot(**screenshot) for screenshot in new_screenshots
+                )
+            try:
+                db.session.commit()
+            except IntegrityError:
+                db.session.rollback()
+                if icon_file and icon_file != old_icon_file:
+                    safe_delete_upload("app_icons", icon_file)
+                if apk_file and apk_file != old_apk_file:
+                    safe_delete_upload("apks", apk_file)
+                for screenshot in new_screenshots:
+                    safe_delete_upload("app_screenshots", screenshot["file_name"])
+                flash("The app or package name was just submitted. Please review your details.", "error")
+            else:
+                if old_icon_file and old_icon_file != icon_file:
+                    safe_delete_upload("app_icons", old_icon_file)
+                if old_apk_file and old_apk_file != apk_file:
+                    safe_delete_upload("apks", old_apk_file)
+                for screenshot_file in old_screenshot_files:
+                    safe_delete_upload("app_screenshots", screenshot_file)
+                account_events.publish(
+                    {
+                        "type": "app_resubmitted" if app_id else "app_created",
+                        "app_id": app_record.id,
+                        "user_id": user.id,
+                        "name": app_record.name,
+                        "status": app_record.status.value,
+                    }
+                )
+                flash(
+                    "Your changes were resubmitted for administrator approval."
+                    if app_id
+                    else "Your app was uploaded and is waiting for administrator approval.",
+                    "success",
+                )
+                return redirect(url_for("main.developer_dashboard"))
+
+    return render_template(
+        "app_submit.html",
+        user=user,
+        categories=AppCategory,
+        age_ratings=AgeRating,
+        form_values=form_values,
+        app_record=app_record,
+        csrf_token=get_csrf_token(),
+    )
+
+
+@main.route("/developer/apps/<int:app_id>/new-version", methods=["GET", "POST"])
+@role_required(UserRole.DEVELOPER)
+def submit_app_version(user, app_id):
+    app_record = db.session.get(StoreApp, app_id)
+    if app_record is None or app_record.developer_id != user.id:
+        abort(404)
+    if app_record.status != AppStatus.APPROVED:
+        flash("The first release must be approved before adding another version.", "warning")
+        return redirect(url_for("main.developer_dashboard"))
+    if app_record.pending_release_status == ReleaseStatus.PENDING:
+        flash("This app already has a version waiting for administrator review.", "warning")
+        return redirect(url_for("main.developer_dashboard"))
+
+    if request.method == "POST":
+        form_values = {
+            "version": request.form.get("version", "").strip(),
+            "min_android_version": request.form.get("min_android_version", "").strip(),
+            "changelog": request.form.get("changelog", "").strip(),
+        }
+    else:
+        form_values = {
+            "version": app_record.pending_version or "",
+            "min_android_version": (
+                app_record.pending_min_android_version or app_record.min_android_version
+            ),
+            "changelog": app_record.pending_changelog or "",
+        }
+
+    if request.method == "POST":
+        if not valid_csrf_token():
+            flash("Your session expired. Please try again.", "error")
+            return redirect(url_for("main.submit_app_version", app_id=app_id))
+
+        errors = []
+        version = form_values["version"]
+        min_android_version = form_values["min_android_version"]
+        changelog = form_values["changelog"]
+        if not version or len(version) > 40:
+            errors.append("Enter a valid version number.")
+        elif version.casefold() == app_record.version.casefold():
+            errors.append("The new version must be different from the published version.")
+        elif any(
+            history.version.casefold() == version.casefold()
+            for history in app_record.version_history
+        ):
+            errors.append("That version number was already published.")
+        if not min_android_version or len(min_android_version) > 40:
+            errors.append("Enter the minimum Android version.")
+        if len(changelog) < 10:
+            errors.append("Describe what changed in at least 10 characters.")
+
+        old_pending_apk = app_record.pending_apk_file
+        apk_file = None
+        apk_original = None
+        apk_size = None
+        apk_sha256 = None
+        apk_scan_summary = None
+        apk_scan_status = None
+        apk_scanned_at = None
+        apk_upload = request.files.get("apk_file")
+        if not errors:
+            try:
+                if apk_upload and apk_upload.filename:
+                    (
+                        apk_file,
+                        apk_original,
+                        apk_size,
+                        apk_sha256,
+                        apk_scan_summary,
+                    ) = save_apk_upload(apk_upload)
+                    if duplicate_apk_exists(
+                        apk_sha256,
+                        allow_pending_app_id=app_record.id,
+                    ):
+                        raise ValueError(
+                            "This exact APK build is already registered in the marketplace."
+                        )
+                    apk_scan_status = SecurityScanStatus.PASSED
+                    apk_scanned_at = datetime.now(timezone.utc)
+                elif app_record.pending_apk_file:
+                    apk_file = app_record.pending_apk_file
+                    apk_original = app_record.pending_apk_original_name
+                    apk_size = app_record.pending_apk_size
+                    apk_sha256 = app_record.pending_apk_sha256
+                    apk_scan_summary = app_record.pending_security_scan_summary
+                    apk_scan_status = app_record.pending_security_scan_status
+                    apk_scanned_at = app_record.pending_security_scanned_at
+                else:
+                    raise ValueError("Choose the APK for this version.")
+            except ValueError as error:
+                errors.append(str(error))
+                if apk_file and apk_file != old_pending_apk:
+                    safe_delete_upload("apks", apk_file)
+
+        if errors:
+            for error in errors:
+                flash(error, "error")
+        else:
+            app_record.pending_version = version
+            app_record.pending_min_android_version = min_android_version
+            app_record.pending_changelog = changelog
+            app_record.pending_apk_file = apk_file
+            app_record.pending_apk_original_name = apk_original
+            app_record.pending_apk_size = apk_size
+            app_record.pending_apk_sha256 = apk_sha256
+            app_record.pending_security_scan_status = apk_scan_status
+            app_record.pending_security_scan_summary = apk_scan_summary
+            app_record.pending_security_scanned_at = apk_scanned_at
+            app_record.pending_release_status = ReleaseStatus.PENDING
+            app_record.pending_release_note = None
+            app_record.pending_release_submitted_at = datetime.now(timezone.utc)
+            db.session.commit()
+            if old_pending_apk and old_pending_apk != apk_file:
+                safe_delete_upload("apks", old_pending_apk)
+            account_events.publish(
+                {
+                    "type": "release_submitted",
+                    "app_id": app_record.id,
+                    "user_id": user.id,
+                    "name": app_record.name,
+                    "status": ReleaseStatus.PENDING.value,
+                    "version": version,
+                }
+            )
+            flash(
+                f"Version {version} is waiting for administrator approval. "
+                f"Version {app_record.version} remains live.",
+                "success",
+            )
+            return redirect(url_for("main.developer_dashboard"))
+
+    return render_template(
+        "app_version_submit.html",
+        user=user,
+        app_record=app_record,
+        form_values=form_values,
+        csrf_token=get_csrf_token(),
+    )
+
+
+@main.get("/apps")
+def app_marketplace():
+    category_value = request.args.get("category", "all")
+    query_text = request.args.get("q", "").strip()
+    apps_query = StoreApp.query.filter_by(status=AppStatus.APPROVED)
+    if category_value in {category.value for category in AppCategory}:
+        apps_query = apps_query.filter(StoreApp.category == AppCategory(category_value))
+    if query_text:
+        search = f"%{query_text.lower()}%"
+        apps_query = apps_query.filter(
+            or_(
+                func.lower(StoreApp.name).like(search),
+                func.lower(StoreApp.short_description).like(search),
+                func.lower(StoreApp.description).like(search),
+            )
+        )
+    apps = apps_query.order_by(StoreApp.approved_at.desc(), StoreApp.id.desc()).all()
+    return render_template(
+        "app_marketplace.html",
+        apps=apps,
+        categories=AppCategory,
+        category_value=category_value,
+        query_text=query_text,
+    )
+
+
+@main.get("/apps/<slug>")
+def app_detail(slug):
+    app_record = StoreApp.query.filter_by(slug=slug, status=AppStatus.APPROVED).first_or_404()
+    return render_template("app_detail.html", app_record=app_record)
+
+
+@main.get("/apps/<slug>/download")
+def download_app(slug):
+    app_record = StoreApp.query.filter_by(slug=slug, status=AppStatus.APPROVED).first_or_404()
+    apk_path = private_upload_folder("apks") / app_record.apk_file
+    if not apk_path.is_file():
+        abort(404)
+    app_record.download_count += 1
+    db.session.commit()
+    return send_private_upload(
+        "apks",
+        app_record.apk_file,
+        download_name=app_record.apk_original_name,
+        as_attachment=True,
+    )
+
+
+@main.get("/apps/<int:app_id>/icon")
+def app_icon(app_id):
+    app_record = db.session.get(StoreApp, app_id)
+    if app_record is None:
+        abort(404)
+    viewer = current_user()
+    can_view = app_record.status == AppStatus.APPROVED or (
+        viewer
+        and (
+            viewer.role == UserRole.ADMIN
+            or viewer.id == app_record.developer_id
+        )
+    )
+    if not can_view:
+        abort(404)
+    return send_private_upload("app_icons", app_record.icon_file)
+
+
+@main.get("/apps/screenshots/<int:screenshot_id>")
+def app_screenshot(screenshot_id):
+    screenshot = db.session.get(AppScreenshot, screenshot_id)
+    if screenshot is None:
+        abort(404)
+    viewer = current_user()
+    can_view = screenshot.app.status == AppStatus.APPROVED or (
+        viewer
+        and (
+            viewer.role == UserRole.ADMIN
+            or viewer.id == screenshot.app.developer_id
+        )
+    )
+    if not can_view:
+        abort(404)
+    return send_private_upload("app_screenshots", screenshot.file_name)
+
+
 @main.route("/admin")
 @role_required(UserRole.ADMIN)
 def admin_dashboard(admin):
@@ -349,6 +1224,275 @@ def admin_dashboard(admin):
     )
 
 
+@main.get("/admin/developers/<int:user_id>")
+@role_required(UserRole.ADMIN)
+def admin_developer_review(admin, user_id):
+    developer = db.session.get(User, user_id)
+    if developer is None or developer.role != UserRole.DEVELOPER:
+        abort(404)
+    return render_template(
+        "admin_developer_review.html",
+        admin=admin,
+        developer=developer,
+        profile=developer.developer_profile,
+        csrf_token=get_csrf_token(),
+    )
+
+
+@main.get("/admin/developers/<int:user_id>/government-id")
+@role_required(UserRole.ADMIN)
+def admin_developer_government_id(admin, user_id):
+    developer = db.session.get(User, user_id)
+    if (
+        developer is None
+        or developer.role != UserRole.DEVELOPER
+        or developer.developer_profile is None
+        or not developer.developer_profile.government_id_file
+    ):
+        abort(404)
+    return send_private_upload(
+        "developer_ids",
+        developer.developer_profile.government_id_file,
+        download_name=developer.developer_profile.government_id_original_name,
+    )
+
+
+@main.get("/admin/apps")
+@role_required(UserRole.ADMIN)
+def admin_apps(admin):
+    status_value = request.args.get("status", "all")
+    query_text = request.args.get("q", "").strip()
+    apps_query = StoreApp.query
+    if status_value == AppStatus.PENDING.value:
+        apps_query = apps_query.filter(
+            or_(
+                StoreApp.status == AppStatus.PENDING,
+                StoreApp.pending_release_status == ReleaseStatus.PENDING,
+            )
+        )
+    elif status_value in {status.value for status in AppStatus}:
+        apps_query = apps_query.filter(StoreApp.status == AppStatus(status_value))
+    if query_text:
+        search = f"%{query_text.lower()}%"
+        apps_query = apps_query.join(User).filter(
+            or_(
+                func.lower(StoreApp.name).like(search),
+                func.lower(StoreApp.package_name).like(search),
+                func.lower(User.username).like(search),
+            )
+        )
+    apps = apps_query.order_by(StoreApp.submitted_at.desc(), StoreApp.id.desc()).all()
+    counts = {
+        "total": StoreApp.query.count(),
+        "pending": StoreApp.query.filter(
+            or_(
+                StoreApp.status == AppStatus.PENDING,
+                StoreApp.pending_release_status == ReleaseStatus.PENDING,
+            )
+        ).count(),
+        "approved": StoreApp.query.filter_by(status=AppStatus.APPROVED).count(),
+        "blocked": StoreApp.query.filter_by(status=AppStatus.BLOCKED).count(),
+    }
+    return render_template(
+        "admin_apps.html",
+        admin=admin,
+        apps=apps,
+        counts=counts,
+        statuses=AppStatus,
+        status_value=status_value,
+        query_text=query_text,
+        csrf_token=get_csrf_token(),
+    )
+
+
+@main.get("/admin/apps/<int:app_id>")
+@role_required(UserRole.ADMIN)
+def admin_app_review(admin, app_id):
+    app_record = db.session.get(StoreApp, app_id)
+    if app_record is None:
+        abort(404)
+    return render_template(
+        "admin_app_review.html",
+        admin=admin,
+        app_record=app_record,
+        csrf_token=get_csrf_token(),
+    )
+
+
+@main.get("/admin/apps/<int:app_id>/apk")
+@role_required(UserRole.ADMIN)
+def admin_download_apk(admin, app_id):
+    app_record = db.session.get(StoreApp, app_id)
+    if app_record is None:
+        abort(404)
+    return send_private_upload(
+        "apks",
+        app_record.apk_file,
+        download_name=app_record.apk_original_name,
+        as_attachment=True,
+    )
+
+
+@main.get("/admin/apps/<int:app_id>/pending-apk")
+@role_required(UserRole.ADMIN)
+def admin_download_pending_apk(admin, app_id):
+    app_record = db.session.get(StoreApp, app_id)
+    if app_record is None or not app_record.pending_apk_file:
+        abort(404)
+    return send_private_upload(
+        "apks",
+        app_record.pending_apk_file,
+        download_name=app_record.pending_apk_original_name,
+        as_attachment=True,
+    )
+
+
+@main.post("/admin/apps/<int:app_id>/release/<action>")
+@role_required(UserRole.ADMIN)
+def manage_app_release(admin, app_id, action):
+    if not valid_csrf_token():
+        flash("Your session expired. Please try again.", "error")
+        return redirect(url_for("main.admin_apps"))
+    app_record = db.session.get(StoreApp, app_id)
+    if app_record is None or app_record.pending_release_status is None:
+        abort(404)
+    if action not in {"approve", "reject"}:
+        abort(404)
+
+    version = app_record.pending_version
+    if action == "approve":
+        if app_record.pending_release_status != ReleaseStatus.PENDING:
+            flash("Only a pending version can be approved.", "error")
+            return redirect(url_for("main.admin_app_review", app_id=app_id))
+        if app_record.pending_security_scan_status != SecurityScanStatus.PASSED:
+            flash("This version must pass structural safety checks before approval.", "error")
+            return redirect(url_for("main.admin_app_review", app_id=app_id))
+        previous = AppVersionHistory(
+            app=app_record,
+            version=app_record.version,
+            min_android_version=app_record.min_android_version,
+            changelog=app_record.changelog,
+            apk_file=app_record.apk_file,
+            apk_original_name=app_record.apk_original_name,
+            apk_size=app_record.apk_size,
+            apk_sha256=app_record.apk_sha256,
+            published_at=app_record.approved_at or app_record.created_at,
+        )
+        db.session.add(previous)
+        app_record.version = app_record.pending_version
+        app_record.min_android_version = app_record.pending_min_android_version
+        app_record.changelog = app_record.pending_changelog
+        app_record.apk_file = app_record.pending_apk_file
+        app_record.apk_original_name = app_record.pending_apk_original_name
+        app_record.apk_size = app_record.pending_apk_size
+        app_record.apk_sha256 = app_record.pending_apk_sha256
+        app_record.security_scan_status = app_record.pending_security_scan_status
+        app_record.security_scan_summary = app_record.pending_security_scan_summary
+        app_record.security_scanned_at = app_record.pending_security_scanned_at
+        app_record.approved_at = datetime.now(timezone.utc)
+        app_record.clear_pending_release()
+        message = f"Version {version} of {app_record.name} was published."
+        status_value = "approved"
+    else:
+        note = request.form.get("review_note", "").strip()
+        app_record.pending_release_status = ReleaseStatus.REJECTED
+        app_record.pending_release_note = note or "This version was not approved."
+        message = f"Version {version} of {app_record.name} was rejected."
+        status_value = "rejected"
+
+    db.session.commit()
+    event = account_events.publish(
+        {
+            "type": "release_updated",
+            "action": action,
+            "app_id": app_record.id,
+            "user_id": app_record.developer_id,
+            "name": app_record.name,
+            "version": version,
+            "status": status_value,
+        }
+    )
+    if request.headers.get("X-Requested-With") == "fetch":
+        return jsonify({"ok": True, "message": message, "event": event})
+    flash(message, "success")
+    return redirect(url_for("main.admin_app_review", app_id=app_id))
+
+
+@main.post("/admin/apps/<int:app_id>/<action>")
+@role_required(UserRole.ADMIN)
+def manage_app(admin, app_id, action):
+    if not valid_csrf_token():
+        flash("Your session expired. Please try again.", "error")
+        return redirect(url_for("main.admin_apps"))
+    app_record = db.session.get(StoreApp, app_id)
+    if app_record is None:
+        abort(404)
+    if action not in {"approve", "reject", "block", "delete"}:
+        abort(404)
+    if action == "approve" and app_record.developer.status != AccountStatus.APPROVED:
+        flash("Approve the developer account before approving this app.", "error")
+        return redirect(url_for("main.admin_app_review", app_id=app_id))
+    if action == "approve" and app_record.security_scan_status != SecurityScanStatus.PASSED:
+        flash("This APK must pass structural safety checks before approval.", "error")
+        return redirect(url_for("main.admin_app_review", app_id=app_id))
+
+    review_note = request.form.get("review_note", "").strip()
+    app_name = app_record.name
+    developer_id = app_record.developer_id
+    cleanup_files = []
+    if action == "approve":
+        app_record.approve()
+    elif action == "reject":
+        app_record.reject(review_note)
+    elif action == "block":
+        app_record.block(review_note)
+    elif action == "delete":
+        cleanup_files.extend(
+            [
+                ("apks", app_record.apk_file),
+                ("apks", app_record.pending_apk_file),
+                ("app_icons", app_record.icon_file),
+            ]
+        )
+        cleanup_files.extend(
+            ("apks", history.apk_file) for history in app_record.version_history
+        )
+        cleanup_files.extend(
+            ("app_screenshots", screenshot.file_name)
+            for screenshot in app_record.screenshots
+        )
+        db.session.delete(app_record)
+
+    db.session.commit()
+    if action == "delete":
+        for folder, filename in cleanup_files:
+            safe_delete_upload(folder, filename)
+        status_value = "deleted"
+    else:
+        status_value = app_record.status.value
+    event = account_events.publish(
+        {
+            "type": "app_updated",
+            "action": action,
+            "app_id": app_id,
+            "user_id": developer_id,
+            "name": app_name,
+            "status": status_value,
+        }
+    )
+    action_labels = {
+        "approve": "approved",
+        "reject": "rejected",
+        "block": "blocked",
+        "delete": "deleted",
+    }
+    message = f"{app_name} was {action_labels[action]}."
+    if request.headers.get("X-Requested-With") == "fetch":
+        return jsonify({"ok": True, "message": message, "event": event})
+    flash(message, "success")
+    return redirect(url_for("main.admin_apps"))
+
+
 def server_event_response(event_filter):
     subscriber = account_events.subscribe()
 
@@ -379,13 +1523,32 @@ def server_event_response(event_filter):
 @main.get("/events/admin-accounts")
 @role_required(UserRole.ADMIN)
 def admin_account_events(admin):
-    return server_event_response(lambda event: True)
+    return server_event_response(
+        lambda event: event.get("type", "").startswith("account_")
+    )
+
+
+@main.get("/events/admin-apps")
+@role_required(UserRole.ADMIN)
+def admin_app_events(admin):
+    return server_event_response(
+        lambda event: event.get("type", "").startswith(("app_", "release_"))
+    )
+
+
+@main.get("/events/developer-apps")
+@developer_access_required
+def developer_app_events(user):
+    return server_event_response(
+        lambda event: event.get("type", "").startswith(("app_", "release_"))
+        and event.get("user_id") == user.id
+    )
 
 
 @main.get("/events/my-account")
 def my_account_events():
     user = current_user()
-    if user is None or user.status != AccountStatus.APPROVED:
+    if user is None or user.status == AccountStatus.BLOCKED:
         return Response(status=401)
     user_id = user.id
     return server_event_response(lambda event: event.get("user_id") == user_id)
@@ -431,22 +1594,72 @@ def manage_account(admin, user_id, action):
     if action not in labels:
         abort(404)
 
+    if (
+        action == "approve"
+        and account.role == UserRole.DEVELOPER
+        and (
+            account.developer_profile is None
+            or not account.developer_profile.is_submitted
+        )
+    ):
+        flash("The developer must submit identity details before approval.", "error")
+        return redirect(url_for("main.admin_developer_review", user_id=account.id))
+
     username = account.username
     role_value = account.role.value
+    review_note = request.form.get("review_note", "").strip()
+    cleanup_files = []
     if action == "approve":
         account.approve()
+        if account.developer_profile:
+            account.developer_profile.reviewed_at = datetime.now(timezone.utc)
+            account.developer_profile.review_note = None
     elif action == "reject":
         account.reject()
+        if account.developer_profile:
+            account.developer_profile.reviewed_at = datetime.now(timezone.utc)
+            account.developer_profile.review_note = review_note or "Verification was not approved."
     elif action == "block":
         account.block()
     elif action == "unblock":
-        account.unblock()
+        if (
+            account.role == UserRole.DEVELOPER
+            and (
+                account.developer_profile is None
+                or not account.developer_profile.is_submitted
+            )
+        ):
+            account.status = AccountStatus.PENDING
+            account.approved_at = None
+        else:
+            account.unblock()
     elif action == "delete":
+        if account.developer_profile and account.developer_profile.government_id_file:
+            cleanup_files.append(
+                ("developer_ids", account.developer_profile.government_id_file)
+            )
+        for app_record in account.apps:
+            cleanup_files.extend(
+                [
+                    ("app_icons", app_record.icon_file),
+                    ("apks", app_record.apk_file),
+                    ("apks", app_record.pending_apk_file),
+                ]
+            )
+            cleanup_files.extend(
+                ("apks", history.apk_file) for history in app_record.version_history
+            )
+            cleanup_files.extend(
+                ("app_screenshots", screenshot.file_name)
+                for screenshot in app_record.screenshots
+            )
         db.session.delete(account)
 
     db.session.commit()
     if action == "delete":
         username_index.remove(username)
+        for folder, filename in cleanup_files:
+            safe_delete_upload(folder, filename)
         status_value = "deleted"
     else:
         status_value = account.status.value
@@ -482,9 +1695,23 @@ def user_dashboard(user):
 @main.route("/developer/dashboard")
 @role_required(UserRole.DEVELOPER)
 def developer_dashboard(user):
+    if not user.developer_profile or not user.developer_profile.is_submitted:
+        flash("Complete identity verification before using the developer studio.", "warning")
+        return redirect(url_for("main.developer_verification"))
+    apps = StoreApp.query.filter_by(developer_id=user.id).order_by(
+        StoreApp.submitted_at.desc(),
+        StoreApp.id.desc(),
+    ).all()
+    app_counts = {
+        "published": sum(app.status == AppStatus.APPROVED for app in apps),
+        "pending": sum(app.status == AppStatus.PENDING for app in apps),
+        "downloads": sum(app.download_count for app in apps),
+    }
     return render_template(
         "developer_dashboard.html",
         user=user,
+        apps=apps,
+        app_counts=app_counts,
         csrf_token=get_csrf_token(),
     )
 

@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head><meta charset="UTF-8"><meta name="viewport"
+            content="width=device-width, initial-scale=1.0"><title>Review {{
+            app_record.name }} | Appora Admin</title><link rel="preconnect"
+            href="https://fonts.googleapis.com"><link rel="preconnect"
+            href="https://fonts.gstatic.com" crossorigin><link
+            href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&amp;family=Plus+Jakarta+Sans:wght@600;700;800&amp;display=swap"
+            rel="stylesheet"><link
+            href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+            rel="stylesheet"><link
+            href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css"
+            rel="stylesheet"><link rel="stylesheet"
+            href="{{ url_for('static', filename='style.css') }}"></head>
+    <body class="admin-page review-page">
+        <aside class="admin-sidebar" id="adminSidebar"><a class="navbar-brand"
+                href="{{ url_for('main.admin_dashboard') }}"><span
+                    class="brand-mark"><i
+                        class="bi bi-boxes"></i></span>Appora</a><span
+                class="sidebar-label">Workspace</span><nav
+                class="sidebar-nav"><a
+                    href="{{ url_for('main.admin_dashboard') }}"><i
+                        class="bi bi-people"></i>Accounts</a><a class="active"
+                    href="{{ url_for('main.admin_apps') }}"><i
+                        class="bi bi-box-seam"></i>App review</a><a
+                    href="{{ url_for('main.app_marketplace') }}"><i
+                        class="bi bi-shop"></i>Storefront</a></nav><div
+                class="sidebar-admin"><span class="admin-avatar">{{
+                    admin.initials }}</span><div><strong>{{ admin.username
+                        }}</strong><small>Administrator</small></div><form
+                    method="post" action="{{ url_for('main.logout') }}"><input
+                        type="hidden" name="csrf_token"
+                        value="{{ csrf_token }}"><button type="submit"><i
+                            class="bi bi-box-arrow-right"></i></button></form></div></aside>
+        <main class="admin-main"><header class="admin-topbar"><button
+                    class="sidebar-toggle" type="button" id="sidebarToggle"><i
+                        class="bi bi-list"></i></button><div><p>App
+                        review</p><h1>{{ app_record.name }}</h1></div><a
+                    class="topbar-store-link"
+                    href="{{ url_for('main.admin_apps') }}"><i
+                        class="bi bi-arrow-left"></i><span>All
+                        submissions</span></a></header>
+            {% with messages = get_flashed_messages(with_categories=true) %}{%
+            for category, message in messages %}<div
+                class="dashboard-alert {{ category }}"><i
+                    class="bi bi-exclamation-circle-fill"></i>{{ message
+                }}</div>{% endfor %}{% endwith %}
+            <section class="app-review-hero"><img
+                    src="{{ url_for('main.app_icon', app_id=app_record.id) }}"
+                    alt="{{ app_record.name }} icon"><div><span
+                        class="status-chip {{ app_record.status.value }}"><i></i>{{
+                        app_record.status_label }}</span><h2>{{ app_record.name
+                        }}</h2><p>{{ app_record.short_description }}</p><div
+                        class="app-review-tags"><span>{{
+                            app_record.category_label }}</span><span>{{
+                            app_record.age_rating.value|title }}</span><span>v{{
+                            app_record.version }}</span></div></div><a
+                    class="btn btn-dark rounded-pill"
+                    href="{{ url_for('main.admin_download_apk', app_id=app_record.id) }}"><i
+                        class="bi bi-download me-2"></i>Download
+                    APK</a></section>
+            {% if app_record.screenshots %}<section class="review-screenshot-card"><div class="review-card-heading"><span><i class="bi bi-images"></i></span><div><h2>App screenshots</h2><p>Images that will appear on the public store listing.</p></div></div><div class="admin-screenshot-gallery">{% for screenshot in app_record.screenshots %}<a href="{{ url_for('main.app_screenshot', screenshot_id=screenshot.id) }}" target="_blank"><img src="{{ url_for('main.app_screenshot', screenshot_id=screenshot.id) }}" alt="{{ app_record.name }} screenshot {{ loop.index }}"></a>{% endfor %}</div></section>{% endif %}
+            <div class="review-grid app-detail-grid"><section
+                    class="review-card"><div
+                        class="review-card-heading"><span><i
+                                class="bi bi-card-text"></i></span><div><h2>Store
+                                listing</h2><p>Content that will be
+                                published.</p></div></div><h3
+                        class="detail-subtitle">Full description</h3><p
+                        class="long-copy">{{ app_record.description }}</p>{% if
+                    app_record.changelog %}<h3 class="detail-subtitle">What is
+                        new</h3><p class="long-copy">{{ app_record.changelog
+                        }}</p>{% endif %}</section><section
+                    class="review-card"><div
+                        class="review-card-heading"><span><i
+                                class="bi bi-file-earmark-code"></i></span><div><h2>Build
+                                information</h2><p>Verify package and release
+                                details.</p></div></div><dl
+                        class="detail-list"><div><dt>Package</dt><dd>{{
+                                app_record.package_name
+                                }}</dd></div><div><dt>Version</dt><dd>{{
+                                app_record.version }}</dd></div><div><dt>Minimum
+                                Android</dt><dd>{{
+                                app_record.min_android_version
+                                }}</dd></div><div><dt>APK file</dt><dd>{{
+                                app_record.apk_original_name
+                                }}</dd></div><div><dt>File size</dt><dd>{{
+                                app_record.formatted_size
+                                }}</dd></div><div><dt>SHA-256</dt><dd
+                                class="hash-value">{{ app_record.apk_sha256
+                                }}</dd></div></dl><div class="security-scan-result {{ app_record.security_scan_status.value }}"><i class="bi {{ 'bi-shield-check' if app_record.security_scan_status.value == 'passed' else 'bi-shield-exclamation' }}"></i><div><strong>Structural safety: {{ app_record.security_scan_status.value|title }}</strong><p>{{ app_record.security_scan_summary or 'This legacy APK has not been structurally checked. Ask the developer to resubmit it before approval.' }}</p>{% if app_record.security_scanned_at %}<small>Checked {{ app_record.security_scanned_at.strftime('%d %b %Y, %H:%M') }}</small>{% endif %}</div></div></section></div>
+            <div class="review-grid"><section class="review-card"><div
+                        class="review-card-heading"><span><i
+                                class="bi bi-person-check"></i></span><div><h2>Publisher</h2><p>Verified
+                                developer account.</p></div></div><dl
+                        class="detail-list"><div><dt>Developer</dt><dd><a
+                                    href="{{ url_for('main.admin_developer_review', user_id=app_record.developer.id) }}">{{
+                                    app_record.developer.company_name or
+                                    app_record.developer.username
+                                    }}</a></dd></div><div><dt>Account
+                                status</dt><dd>{{
+                                app_record.developer.status_label
+                                }}</dd></div><div><dt>Support</dt><dd>{{
+                                app_record.support_email
+                                }}</dd></div><div><dt>Website</dt><dd>{% if
+                                app_record.website %}<a
+                                    href="{{ app_record.website }}"
+                                    target="_blank" rel="noopener">Open
+                                    website</a>{% else %}Not provided{% endif
+                                %}</dd></div><div><dt>Privacy policy</dt><dd><a
+                                    href="{{ app_record.privacy_policy_url }}"
+                                    target="_blank" rel="noopener">Open
+                                    policy</a></dd></div></dl></section><section
+                    class="review-card"><div
+                        class="review-card-heading"><span><i
+                                class="bi bi-clock-history"></i></span><div><h2>Submission</h2><p>Review
+                                state and timing.</p></div></div><dl
+                        class="detail-list"><div><dt>Submitted</dt><dd>{{
+                                app_record.submitted_at.strftime('%d %b %Y, %H:%M')
+                                }}</dd></div><div><dt>Downloads</dt><dd>{{
+                                app_record.download_count }}</dd></div>{% if
+                        app_record.review_note %}<div><dt>Review note</dt><dd>{{
+                                app_record.review_note }}</dd></div>{% endif
+                        %}</dl></section></div>
+            {% if app_record.pending_release_status %}
+            <section class="pending-release-review {{ app_record.pending_release_status.value }}">
+                <div class="pending-release-heading"><div><span class="section-label">Version update</span><h2>Review version {{ app_record.pending_version }}</h2><p>The published version {{ app_record.version }} remains live until this build is approved.</p></div><span class="status-chip {{ app_record.pending_release_status.value }}"><i></i>{{ app_record.pending_release_status.value|title }}</span></div>
+                <div class="pending-release-grid"><dl class="detail-list"><div><dt>New version</dt><dd>{{ app_record.pending_version }}</dd></div><div><dt>Minimum Android</dt><dd>{{ app_record.pending_min_android_version }}</dd></div><div><dt>APK file</dt><dd>{{ app_record.pending_apk_original_name }}</dd></div><div><dt>File size</dt><dd>{{ app_record.pending_formatted_size }}</dd></div><div><dt>SHA-256</dt><dd class="hash-value">{{ app_record.pending_apk_sha256 }}</dd></div></dl><div><h3>Release notes</h3><p>{{ app_record.pending_changelog }}</p><div class="security-scan-result {{ app_record.pending_security_scan_status.value if app_record.pending_security_scan_status else 'unscanned' }}"><i class="bi {{ 'bi-shield-check' if app_record.pending_security_scan_status and app_record.pending_security_scan_status.value == 'passed' else 'bi-shield-exclamation' }}"></i><div><strong>Structural safety: {{ app_record.pending_security_scan_status.value|title if app_record.pending_security_scan_status else 'Unscanned' }}</strong><p>{{ app_record.pending_security_scan_summary or 'No structural scan result is available.' }}</p></div></div>{% if app_record.pending_release_note %}<div class="review-note"><strong>Review note</strong><p>{{ app_record.pending_release_note }}</p></div>{% endif %}<a class="btn btn-dark rounded-pill" href="{{ url_for('main.admin_download_pending_apk', app_id=app_record.id) }}"><i class="bi bi-download me-2"></i>Download version {{ app_record.pending_version }}</a></div></div>
+                {% if app_record.pending_release_status.value == 'pending' %}<div class="pending-release-actions"><form method="post" action="{{ url_for('main.manage_app_release', app_id=app_record.id, action='approve') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-success btn-lg rounded-pill" type="submit"><i class="bi bi-cloud-check me-2"></i>Approve version</button></form><form class="reject-form" method="post" action="{{ url_for('main.manage_app_release', app_id=app_record.id, action='reject') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><textarea name="review_note" rows="2" required placeholder="Reason shown to developer"></textarea><button class="btn btn-outline-danger rounded-pill" type="submit">Reject version</button></form></div>{% endif %}
+            </section>
+            {% endif %}
+            {% if app_record.version_history %}<section class="version-history-card"><div class="review-card-heading"><span><i class="bi bi-clock-history"></i></span><div><h2>Version history</h2><p>Previously published builds retained for audit and rollback planning.</p></div></div><div class="version-history-list">{% for version in app_record.version_history %}<div><strong>v{{ version.version }}</strong><span>{{ version.formatted_size }}</span><span>Published {{ version.published_at.strftime('%d %b %Y') }}</span><code>{{ version.apk_sha256[:12] }}…</code></div>{% endfor %}</div></section>{% endif %}
+            <section class="decision-card"><div><span
+                        class="section-label">Decision</span><h2>Publish or
+                        return this app</h2><p>Approved apps appear in the
+                        marketplace and their APK becomes publicly downloadable
+                        immediately.</p></div><div class="decision-actions">{%
+                    if app_record.status.value != 'approved' %}<form
+                        method="post"
+                        action="{{ url_for('main.manage_app', app_id=app_record.id, action='approve') }}"><input
+                            type="hidden" name="csrf_token"
+                            value="{{ csrf_token }}"><button
+                            class="btn btn-success btn-lg rounded-pill"
+                            type="submit"><i
+                                class="bi bi-cloud-check me-2"></i>Approve and
+                            publish</button></form>{% endif %}{% if app_record.status.value != 'approved' %}<form
+                        class="reject-form" method="post"
+                        action="{{ url_for('main.manage_app', app_id=app_record.id, action='reject') }}"><input
+                            type="hidden" name="csrf_token"
+                            value="{{ csrf_token }}"><textarea
+                            name="review_note" rows="2" required
+                            placeholder="Reason shown to developer"></textarea><button
+                            class="btn btn-outline-danger rounded-pill"
+                            type="submit">Reject app</button></form>{% endif %}{% if
+                    app_record.status.value == 'approved' %}<form method="post"
+                        action="{{ url_for('main.manage_app', app_id=app_record.id, action='block') }}"><input
+                            type="hidden" name="csrf_token"
+                            value="{{ csrf_token }}"><input type="hidden"
+                            name="review_note"
+                            value="Removed by administrator"><button
+                            class="btn btn-outline-dark rounded-pill"
+                            type="submit">Block from store</button></form>{%
+                    endif %}<form method="post"
+                        action="{{ url_for('main.manage_app', app_id=app_record.id, action='delete') }}"
+                        onsubmit="return confirm('Permanently delete this app and its APK?')"><input
+                            type="hidden" name="csrf_token"
+                            value="{{ csrf_token }}"><button
+                            class="btn btn-outline-danger rounded-pill"
+                            type="submit"><i
+                                class="bi bi-trash3 me-2"></i>Delete
+                            permanently</button></form></div></section>
+        </main><div class="sidebar-backdrop"
+            id="sidebarBackdrop"></div><script>const sidebar=document.getElementById('adminSidebar'),backdrop=document.getElementById('sidebarBackdrop');document.getElementById('sidebarToggle').addEventListener('click',()=>{sidebar.classList.toggle('open');backdrop.classList.toggle('show')});backdrop.addEventListener('click',()=>{sidebar.classList.remove('open');backdrop.classList.remove('show')});</script>
+    </body></html>
