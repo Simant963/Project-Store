@@ -1,4 +1,5 @@
 import io
+import base64
 import os
 import re
 import shutil
@@ -17,13 +18,26 @@ os.environ["ADMIN_PASSWORD"] = "AdminPass123!"
 
 from app import app
 from application.database import db
+import application.controllers as controllers
 from application.models import (
     AccountStatus, DeveloperProfile, GovernmentIdType, SecurityScanStatus,
     StoreApp, User, UserRole,
 )
 
 app.config["TESTING"] = True
-PNG = b"\x89PNG\r\n\x1a\n" + b"icon-data"
+real_malware_scanner = controllers.scan_apk_for_malware
+with app.app_context():
+    configured_scanner = app.config["CLAMAV_COMMAND"]
+    app.config["CLAMAV_COMMAND"] = "definitely-missing-clamscan"
+    try:
+        real_malware_scanner(test_root / "missing.apk")
+        raise AssertionError("Malware scanning must fail closed when ClamAV is unavailable")
+    except ValueError as error:
+        assert "unavailable" in str(error)
+    finally:
+        app.config["CLAMAV_COMMAND"] = configured_scanner
+controllers.scan_apk_for_malware = lambda path: "ClamAV malware scan passed · no threats detected"
+PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
 
 
 def apk_bytes(entries):
@@ -92,6 +106,8 @@ try:
         secure_app = StoreApp.query.filter_by(package_name="com.example.securenotes").one()
         app_id = secure_app.id
         assert secure_app.security_scan_status == SecurityScanStatus.PASSED
+        assert secure_app.malware_scan_status == SecurityScanStatus.PASSED
+        assert "no threats detected" in secure_app.malware_scan_summary
         assert "Android manifest found" in secure_app.security_scan_summary
 
     token = csrf(developer_client, "/developer/apps/new")
@@ -113,6 +129,7 @@ try:
     admin.post("/admin/login", data={"csrf_token": token, "identifier": "security_admin", "password": "AdminPass123!"})
     review = admin.get(f"/admin/apps/{app_id}")
     assert review.status_code == 200 and b"Structural safety: Passed" in review.data
+    assert b"Malware scan: Clean" in review.data
     with admin.session_transaction() as session:
         admin_token = session["_csrf_token"]
     approved = admin.post(f"/admin/apps/{app_id}/approve", data={"csrf_token": admin_token}, follow_redirects=True)

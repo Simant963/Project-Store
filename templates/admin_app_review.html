@@ -59,6 +59,7 @@
                     href="{{ url_for('main.admin_download_apk', app_id=app_record.id) }}"><i
                         class="bi bi-download me-2"></i>Download
                     APK</a></section>
+            <section class="security-scan-result {{ app_record.malware_scan_status.value }}"><i class="bi {{ 'bi-shield-check' if app_record.malware_scan_status.value == 'passed' else 'bi-shield-exclamation' }}"></i><div><strong>Malware scan: {{ 'Clean' if app_record.malware_scan_status.value == 'passed' else app_record.malware_scan_status.value|title }}</strong><p>{{ app_record.malware_scan_summary or 'No ClamAV malware scan result is available. This APK cannot be approved.' }}</p>{% if app_record.malware_scanned_at %}<small>Scanned {{ app_record.malware_scanned_at.strftime('%d %b %Y, %H:%M') }}</small>{% endif %}</div></section>
             {% if app_record.screenshots %}<section class="review-screenshot-card"><div class="review-card-heading"><span><i class="bi bi-images"></i></span><div><h2>App screenshots</h2><p>Images that will appear on the public store listing.</p></div></div><div class="admin-screenshot-gallery">{% for screenshot in app_record.screenshots %}<a href="{{ url_for('main.app_screenshot', screenshot_id=screenshot.id) }}" target="_blank"><img src="{{ url_for('main.app_screenshot', screenshot_id=screenshot.id) }}" alt="{{ app_record.name }} screenshot {{ loop.index }}"></a>{% endfor %}</div></section>{% endif %}
             <div class="review-grid app-detail-grid"><section
                     class="review-card"><div

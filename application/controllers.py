@@ -2,13 +2,17 @@ import json
 import hashlib
 import re
 import secrets
+import smtplib
+import subprocess
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from functools import wraps
 from pathlib import Path, PurePosixPath
 from queue import Empty
 from urllib.parse import urlparse
 
+from PIL import Image, ImageOps, UnidentifiedImageError
 from flask import (
     Blueprint,
     Response,
@@ -26,20 +30,34 @@ from flask import (
 )
 from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import joinedload, selectinload
 from werkzeug.utils import secure_filename
 
 from .database import db
 from .models import (
     AccountStatus,
+    AuditAction,
+    AuditLog,
     AgeRating,
     AppCategory,
     AppStatus,
     AppScreenshot,
+    AppReport,
+    AppReview,
     AppVersionHistory,
     DeveloperProfile,
+    DownloadRecord,
     GovernmentIdType,
+    LoginThrottle,
+    Notification,
+    NotificationType,
+    PasswordResetToken,
+    ReportReason,
+    ReportStatus,
     ReleaseStatus,
     SecurityScanStatus,
+    SavedApp,
+    ReviewStatus,
     StoreApp,
     User,
     UserRole,
@@ -69,9 +87,31 @@ def current_user():
     return db.session.get(User, user_id) if user_id else None
 
 
+def client_ip_address():
+    """Use ProxyFix-normalized remote_addr; never trust forwarding headers directly."""
+    return request.remote_addr or "unknown"
+
+
+def record_admin_audit(admin, action, operation, target_type, target_id, target_label, note=None):
+    remote = client_ip_address()
+    db.session.add(AuditLog(
+        admin_id=admin.id, action=action, operation=operation,
+        target_type=target_type, target_id=target_id, target_label=target_label,
+        note=note or None, ip_address=remote,
+    ))
+
+
+def create_notification(recipient_id, notification_type, title, message, link=None):
+    db.session.add(Notification(
+        recipient_id=recipient_id, type=notification_type, title=title,
+        message=message, link=link,
+    ))
+
+
 def dashboard_url_for(user):
     destinations = {
         UserRole.ADMIN: "main.admin_dashboard",
+        UserRole.CO_ADMIN: "main.admin_apps",
         UserRole.DEVELOPER: "main.developer_dashboard",
         UserRole.USER: "main.user_dashboard",
     }
@@ -87,6 +127,87 @@ def sign_in_user(user, remember=False):
     session.permanent = remember
     user.last_login_at = datetime.now(timezone.utc)
     db.session.commit()
+
+
+def aware_datetime(value):
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=timezone.utc)
+
+
+def login_throttle_key(scope, identifier):
+    remote = client_ip_address()
+    value = f"{scope}|{remote}|{identifier.casefold().strip()}"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def login_is_throttled(scope, identifier):
+    record = LoginThrottle.query.filter_by(
+        key_hash=login_throttle_key(scope, identifier)
+    ).first()
+    if record is None or record.locked_until is None:
+        return False
+    return aware_datetime(record.locked_until) > datetime.now(timezone.utc)
+
+
+def record_login_failure(scope, identifier):
+    now = datetime.now(timezone.utc)
+    key_hash = login_throttle_key(scope, identifier)
+    record = LoginThrottle.query.filter_by(key_hash=key_hash).first()
+    if record is None:
+        record = LoginThrottle(
+            key_hash=key_hash,
+            attempts=0,
+            window_started_at=now,
+        )
+        db.session.add(record)
+    window_start = aware_datetime(record.window_started_at)
+    if now - window_start > timedelta(minutes=15):
+        record.attempts = 0
+        record.window_started_at = now
+        record.locked_until = None
+    record.attempts += 1
+    if record.attempts >= 5:
+        record.locked_until = now + timedelta(minutes=15)
+    db.session.commit()
+
+
+def clear_login_failures(scope, identifier):
+    record = LoginThrottle.query.filter_by(
+        key_hash=login_throttle_key(scope, identifier)
+    ).first()
+    if record:
+        db.session.delete(record)
+        db.session.commit()
+
+
+def deliver_password_reset(user, reset_url):
+    smtp_host = current_app.config.get("SMTP_HOST")
+    if not smtp_host:
+        return False
+    message = EmailMessage()
+    message["Subject"] = "Reset your Appora password"
+    message["From"] = current_app.config["SMTP_FROM_EMAIL"]
+    message["To"] = user.email
+    message.set_content(
+        "A password reset was requested for your Appora account.\n\n"
+        f"Reset your password: {reset_url}\n\n"
+        "This link expires in 30 minutes. If you did not request it, ignore this email."
+    )
+    with smtplib.SMTP(
+        smtp_host,
+        current_app.config["SMTP_PORT"],
+        timeout=15,
+    ) as smtp:
+        if current_app.config["SMTP_USE_TLS"]:
+            smtp.starttls()
+        if current_app.config.get("SMTP_USERNAME"):
+            smtp.login(
+                current_app.config["SMTP_USERNAME"],
+                current_app.config.get("SMTP_PASSWORD", ""),
+            )
+        smtp.send_message(message)
+    return True
 
 
 def role_required(required_role):
@@ -109,6 +230,19 @@ def role_required(required_role):
         return wrapped
 
     return decorator
+
+
+def staff_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        user = current_user()
+        if user is None or user.role not in {UserRole.ADMIN, UserRole.CO_ADMIN} or user.status != AccountStatus.APPROVED:
+            session.clear()
+            flash("Sign in with an authorized review account to continue.", "error")
+            return redirect(url_for("main.admin_login"))
+        return view(user, *args, **kwargs)
+
+    return wrapped
 
 
 def developer_access_required(view):
@@ -175,11 +309,36 @@ def save_image_upload(file_storage, folder, maximum_bytes):
     if extension is None:
         raise ValueError("Upload a JPG, PNG, or WebP image.")
 
+    formats = {".jpg": "JPEG", ".png": "PNG", ".webp": "WEBP"}
+    try:
+        file_storage.stream.seek(0)
+        with Image.open(file_storage.stream) as image:
+            image.verify()
+        file_storage.stream.seek(0)
+        with Image.open(file_storage.stream) as image:
+            width, height = image.size
+            if width < 1 or height < 1 or width > 12000 or height > 12000 or width * height > 40_000_000:
+                raise ValueError("Image dimensions are outside the safe limit.")
+            image = ImageOps.exif_transpose(image)
+            if extension == ".jpg":
+                clean_image = image.convert("RGB")
+            else:
+                clean_image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
+            clean_image.load()
+    except (UnidentifiedImageError, OSError, SyntaxError, Image.DecompressionBombError) as error:
+        raise ValueError("The image is damaged or has an unsafe structure.") from error
+
     stored_name = f"{secrets.token_hex(20)}{extension}"
     target = private_upload_folder(folder) / stored_name
-    file_storage.save(target)
+    try:
+        save_options = {"quality": 90} if extension in {".jpg", ".webp"} else {"optimize": True}
+        clean_image.save(target, format=formats[extension], **save_options)
+    except OSError as error:
+        if target.is_file():
+            target.unlink()
+        raise ValueError("The image could not be stored safely.") from error
     original_name = secure_filename(file_storage.filename) or f"upload{extension}"
-    return stored_name, original_name, size
+    return stored_name, original_name, target.stat().st_size
 
 
 def save_apk_upload(file_storage):
@@ -202,6 +361,7 @@ def save_apk_upload(file_storage):
     try:
         file_storage.save(target)
         scan_summary = inspect_apk_archive(target)
+        malware_summary = scan_apk_for_malware(target)
         digest = hashlib.sha256()
         with target.open("rb") as apk_file:
             for chunk in iter(lambda: apk_file.read(1024 * 1024), b""):
@@ -210,7 +370,33 @@ def save_apk_upload(file_storage):
         if target.is_file():
             target.unlink()
         raise
-    return stored_name, original_name, size, digest.hexdigest(), scan_summary
+    return stored_name, original_name, size, digest.hexdigest(), scan_summary, malware_summary
+
+
+def scan_apk_for_malware(path):
+    """Fail closed unless ClamAV explicitly reports a clean APK."""
+    command = current_app.config["CLAMAV_COMMAND"]
+    timeout = current_app.config["CLAMAV_TIMEOUT_SECONDS"]
+    try:
+        result = subprocess.run(
+            [command, "--no-summary", "--infected", str(path)],
+            capture_output=True, text=True, timeout=timeout, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+        )
+    except FileNotFoundError as error:
+        raise ValueError("Virus scanner is unavailable. The app was not submitted.") from error
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("Virus scanning timed out. The app was not submitted.") from error
+    except OSError as error:
+        raise ValueError("Virus scanning could not start. The app was not submitted.") from error
+
+    if result.returncode == 0:
+        return "ClamAV malware scan passed · no threats detected"
+    if result.returncode == 1:
+        current_app.logger.warning("ClamAV rejected an APK: %s", (result.stdout or "threat detected")[-1000:])
+        raise ValueError("The APK was rejected because malware was detected.")
+    current_app.logger.error("ClamAV scan error %s: %s", result.returncode, (result.stderr or result.stdout)[-1000:])
+    raise ValueError("Virus scanning failed. The app was not submitted.")
 
 
 def inspect_apk_archive(path):
@@ -322,8 +508,9 @@ def unique_app_slug(name):
 def send_private_upload(folder, filename, download_name=None, as_attachment=False):
     if not filename or Path(filename).name != filename:
         abort(404)
-    path = (private_upload_folder(folder) / filename).resolve()
-    if path.parent != private_upload_folder(folder) or not path.is_file():
+    directory = private_upload_folder(folder)
+    path = (directory / filename).resolve()
+    if path.parent != directory or not path.is_file():
         abort(404)
     response = send_file(
         path,
@@ -332,19 +519,9 @@ def send_private_upload(folder, filename, download_name=None, as_attachment=Fals
         conditional=True,
     )
     response.headers["X-Content-Type-Options"] = "nosniff"
-    if not as_attachment:
-        response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Pragma"] = "no-cache"
     return response
-
-
-def remove_app_files(app_record):
-    safe_delete_upload("app_icons", app_record.icon_file)
-    safe_delete_upload("apks", app_record.apk_file)
-    safe_delete_upload("apks", app_record.pending_apk_file)
-    for screenshot in app_record.screenshots:
-        safe_delete_upload("app_screenshots", screenshot.file_name)
-    for history in app_record.version_history:
-        safe_delete_upload("apks", history.apk_file)
 
 
 def validate_registration(form, role):
@@ -392,6 +569,111 @@ def home():
     return render_template("home.html", approved_apps=approved_apps)
 
 
+@main.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    requested_role = request.form.get("role") or request.args.get("role", UserRole.USER.value)
+    if requested_role not in {UserRole.USER.value, UserRole.DEVELOPER.value}:
+        requested_role = UserRole.USER.value
+    development_reset_url = None
+    request_sent = False
+    if request.method == "POST":
+        if not valid_csrf_token():
+            flash("Your session expired. Please try again.", "error")
+            return redirect(url_for("main.forgot_password"))
+        email = request.form.get("email", "").strip().lower()
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+            flash("Enter a valid email address.", "error")
+        else:
+            throttled = login_is_throttled("password-reset", email)
+            if not throttled:
+                record_login_failure("password-reset", email)
+                user = User.query.filter(
+                    func.lower(User.email) == email,
+                    User.status != AccountStatus.BLOCKED,
+                ).first()
+                if user:
+                    now = datetime.now(timezone.utc)
+                    PasswordResetToken.query.filter_by(
+                        user_id=user.id,
+                        used_at=None,
+                    ).update({"used_at": now})
+                    raw_token = secrets.token_urlsafe(40)
+                    reset_record = PasswordResetToken(
+                        user_id=user.id,
+                        token_hash=hashlib.sha256(raw_token.encode("utf-8")).hexdigest(),
+                        expires_at=now + timedelta(minutes=30),
+                    )
+                    db.session.add(reset_record)
+                    db.session.commit()
+                    reset_url = (
+                        current_app.config["PUBLIC_BASE_URL"]
+                        + url_for("main.reset_password", token=raw_token)
+                    )
+                    try:
+                        delivered = deliver_password_reset(user, reset_url)
+                    except (OSError, smtplib.SMTPException):
+                        delivered = False
+                    if current_app.debug and not delivered and current_app.config["PUBLIC_BASE_URL"].startswith(
+                        ("http://127.0.0.1", "http://localhost")
+                    ):
+                        development_reset_url = reset_url
+            request_sent = True
+
+    return render_template(
+        "password_recovery.html",
+        mode="request",
+        request_sent=request_sent,
+        development_reset_url=development_reset_url,
+        recovery_role=requested_role,
+        csrf_token=get_csrf_token(),
+    )
+
+
+@main.route("/reset-password/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    reset_record = PasswordResetToken.query.filter_by(token_hash=token_hash).first()
+    if reset_record is None or not reset_record.is_valid:
+        return render_template(
+            "password_recovery.html",
+            mode="invalid",
+            csrf_token=get_csrf_token(),
+        ), 400
+
+    if request.method == "POST":
+        if not valid_csrf_token():
+            flash("Your session expired. Please try again.", "error")
+            return redirect(url_for("main.reset_password", token=token))
+        password = request.form.get("password", "")
+        confirmation = request.form.get("confirm_password", "")
+        if len(password) < 8 or not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
+            flash("Password must be at least 8 characters and include a letter and a number.", "error")
+        elif password != confirmation:
+            flash("Passwords do not match.", "error")
+        else:
+            now = datetime.now(timezone.utc)
+            reset_record.user.set_password(password)
+            PasswordResetToken.query.filter_by(
+                user_id=reset_record.user_id,
+                used_at=None,
+            ).update({"used_at": now})
+            db.session.commit()
+            session.clear()
+            flash("Your password was updated. Sign in with the new password.", "success")
+            return redirect(
+                url_for("main.account_login", role_name=reset_record.user.role.value)
+                if reset_record.user.role not in {UserRole.ADMIN, UserRole.CO_ADMIN}
+                else url_for("main.admin_login")
+            )
+
+    return render_template(
+        "password_recovery.html",
+        mode="reset",
+        token=token,
+        csrf_token=get_csrf_token(),
+    )
+
+
 @main.get("/api/usernames/availability")
 def username_availability():
     username = request.args.get("username", "").strip()
@@ -408,7 +690,7 @@ def username_availability():
 @main.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     signed_in = current_user()
-    if signed_in and signed_in.role == UserRole.ADMIN:
+    if signed_in and signed_in.role in {UserRole.ADMIN, UserRole.CO_ADMIN}:
         return redirect(dashboard_url_for(signed_in))
 
     if request.method == "POST":
@@ -418,8 +700,11 @@ def admin_login():
 
         identifier = request.form.get("identifier", "").strip()
         password = request.form.get("password", "")
+        if login_is_throttled("admin-login", identifier):
+            flash("Too many sign-in attempts. Try again in 15 minutes.", "error")
+            return redirect(url_for("main.admin_login"))
         admin = User.query.filter(
-            User.role == UserRole.ADMIN,
+            User.role.in_([UserRole.ADMIN, UserRole.CO_ADMIN]),
             or_(
                 func.lower(User.username) == identifier.lower(),
                 func.lower(User.email) == identifier.lower(),
@@ -427,10 +712,12 @@ def admin_login():
         ).first()
 
         if admin and admin.status == AccountStatus.APPROVED and admin.check_password(password):
+            clear_login_failures("admin-login", identifier)
             sign_in_user(admin, request.form.get("remember") == "on")
             flash("Welcome back. You are signed in.", "success")
             return redirect(url_for("main.admin_dashboard"))
 
+        record_login_failure("admin-login", identifier)
         flash("Incorrect administrator username or password.", "error")
 
     return render_template(
@@ -446,7 +733,7 @@ def account_login(role_name):
         role = UserRole(role_name)
     except ValueError:
         abort(404)
-    if role == UserRole.ADMIN:
+    if role in {UserRole.ADMIN, UserRole.CO_ADMIN}:
         return redirect(url_for("main.admin_login"))
 
     signed_in = current_user()
@@ -466,6 +753,9 @@ def account_login(role_name):
 
         identifier = request.form.get("identifier", "").strip()
         password = request.form.get("password", "")
+        if login_is_throttled(f"{role.value}-login", identifier):
+            flash("Too many sign-in attempts. Try again in 15 minutes.", "error")
+            return redirect(url_for("main.account_login", role_name=role.value))
         user = User.query.filter(
             User.role == role,
             or_(
@@ -475,6 +765,7 @@ def account_login(role_name):
         ).first()
 
         if not user or not user.check_password(password):
+            record_login_failure(f"{role.value}-login", identifier)
             flash("Incorrect email, username, or password.", "error")
         elif user.status == AccountStatus.BLOCKED:
             flash("This account has been blocked. Contact the marketplace administrator.", "error")
@@ -482,6 +773,7 @@ def account_login(role_name):
             AccountStatus.PENDING,
             AccountStatus.REJECTED,
         }:
+            clear_login_failures(f"{role.value}-login", identifier)
             sign_in_user(user, request.form.get("remember") == "on")
             return redirect(url_for("main.developer_verification"))
         elif user.status == AccountStatus.PENDING:
@@ -489,6 +781,7 @@ def account_login(role_name):
         elif user.status == AccountStatus.REJECTED:
             flash("This account request was not approved. Contact the marketplace administrator.", "error")
         else:
+            clear_login_failures(f"{role.value}-login", identifier)
             sign_in_user(user, request.form.get("remember") == "on")
             return redirect(dashboard_url_for(user))
 
@@ -510,7 +803,7 @@ def create_account(role_name):
         role = UserRole(role_name)
     except ValueError:
         abort(404)
-    if role == UserRole.ADMIN:
+    if role in {UserRole.ADMIN, UserRole.CO_ADMIN}:
         abort(404)
 
     form_values = {
@@ -796,6 +1089,9 @@ def submit_app(user, app_id=None):
         apk_scan_summary = None
         apk_scan_status = None
         apk_scanned_at = None
+        malware_scan_summary = None
+        malware_scan_status = None
+        malware_scanned_at = None
         new_screenshots = []
         screenshot_uploads = [
             upload
@@ -825,6 +1121,7 @@ def submit_app(user, app_id=None):
                         apk_size,
                         apk_sha256,
                         apk_scan_summary,
+                        malware_scan_summary,
                     ) = save_apk_upload(apk_upload)
                     if duplicate_apk_exists(
                         apk_sha256,
@@ -835,6 +1132,8 @@ def submit_app(user, app_id=None):
                         )
                     apk_scan_status = SecurityScanStatus.PASSED
                     apk_scanned_at = datetime.now(timezone.utc)
+                    malware_scan_status = SecurityScanStatus.PASSED
+                    malware_scanned_at = datetime.now(timezone.utc)
                 elif app_record:
                     apk_file = app_record.apk_file
                     apk_original = app_record.apk_original_name
@@ -843,6 +1142,9 @@ def submit_app(user, app_id=None):
                     apk_scan_summary = app_record.security_scan_summary
                     apk_scan_status = app_record.security_scan_status
                     apk_scanned_at = app_record.security_scanned_at
+                    malware_scan_summary = app_record.malware_scan_summary
+                    malware_scan_status = app_record.malware_scan_status
+                    malware_scanned_at = app_record.malware_scanned_at
                 else:
                     raise ValueError("Choose an APK file to upload.")
                 for position, screenshot_upload in enumerate(screenshot_uploads):
@@ -902,6 +1204,9 @@ def submit_app(user, app_id=None):
             app_record.security_scan_status = apk_scan_status
             app_record.security_scan_summary = apk_scan_summary
             app_record.security_scanned_at = apk_scanned_at
+            app_record.malware_scan_status = malware_scan_status
+            app_record.malware_scan_summary = malware_scan_summary
+            app_record.malware_scanned_at = malware_scanned_at
             app_record.status = AppStatus.PENDING
             app_record.review_note = None
             app_record.submitted_at = datetime.now(timezone.utc)
@@ -1016,6 +1321,9 @@ def submit_app_version(user, app_id):
         apk_scan_summary = None
         apk_scan_status = None
         apk_scanned_at = None
+        malware_scan_summary = None
+        malware_scan_status = None
+        malware_scanned_at = None
         apk_upload = request.files.get("apk_file")
         if not errors:
             try:
@@ -1026,6 +1334,7 @@ def submit_app_version(user, app_id):
                         apk_size,
                         apk_sha256,
                         apk_scan_summary,
+                        malware_scan_summary,
                     ) = save_apk_upload(apk_upload)
                     if duplicate_apk_exists(
                         apk_sha256,
@@ -1036,6 +1345,8 @@ def submit_app_version(user, app_id):
                         )
                     apk_scan_status = SecurityScanStatus.PASSED
                     apk_scanned_at = datetime.now(timezone.utc)
+                    malware_scan_status = SecurityScanStatus.PASSED
+                    malware_scanned_at = datetime.now(timezone.utc)
                 elif app_record.pending_apk_file:
                     apk_file = app_record.pending_apk_file
                     apk_original = app_record.pending_apk_original_name
@@ -1044,6 +1355,9 @@ def submit_app_version(user, app_id):
                     apk_scan_summary = app_record.pending_security_scan_summary
                     apk_scan_status = app_record.pending_security_scan_status
                     apk_scanned_at = app_record.pending_security_scanned_at
+                    malware_scan_summary = app_record.pending_malware_scan_summary
+                    malware_scan_status = app_record.pending_malware_scan_status
+                    malware_scanned_at = app_record.pending_malware_scanned_at
                 else:
                     raise ValueError("Choose the APK for this version.")
             except ValueError as error:
@@ -1065,6 +1379,9 @@ def submit_app_version(user, app_id):
             app_record.pending_security_scan_status = apk_scan_status
             app_record.pending_security_scan_summary = apk_scan_summary
             app_record.pending_security_scanned_at = apk_scanned_at
+            app_record.pending_malware_scan_status = malware_scan_status
+            app_record.pending_malware_scan_summary = malware_scan_summary
+            app_record.pending_malware_scanned_at = malware_scanned_at
             app_record.pending_release_status = ReleaseStatus.PENDING
             app_record.pending_release_note = None
             app_record.pending_release_submitted_at = datetime.now(timezone.utc)
@@ -1099,9 +1416,12 @@ def submit_app_version(user, app_id):
 
 @main.get("/apps")
 def app_marketplace():
+    page = request.args.get("page", 1, type=int)
     category_value = request.args.get("category", "all")
     query_text = request.args.get("q", "").strip()
-    apps_query = StoreApp.query.filter_by(status=AppStatus.APPROVED)
+    apps_query = StoreApp.query.options(
+        joinedload(StoreApp.developer)
+    ).filter_by(status=AppStatus.APPROVED)
     if category_value in {category.value for category in AppCategory}:
         apps_query = apps_query.filter(StoreApp.category == AppCategory(category_value))
     if query_text:
@@ -1113,20 +1433,52 @@ def app_marketplace():
                 func.lower(StoreApp.description).like(search),
             )
         )
-    apps = apps_query.order_by(StoreApp.approved_at.desc(), StoreApp.id.desc()).all()
+    pagination = apps_query.order_by(StoreApp.approved_at.desc(), StoreApp.id.desc()).paginate(
+        page=page, per_page=12, error_out=False
+    )
+    apps = pagination.items
     return render_template(
         "app_marketplace.html",
         apps=apps,
         categories=AppCategory,
         category_value=category_value,
         query_text=query_text,
+        pagination=pagination,
+        pagination_params={key: value for key, value in request.args.items() if key != "page"},
     )
 
 
 @main.get("/apps/<slug>")
 def app_detail(slug):
-    app_record = StoreApp.query.filter_by(slug=slug, status=AppStatus.APPROVED).first_or_404()
-    return render_template("app_detail.html", app_record=app_record)
+    app_record = StoreApp.query.options(
+        joinedload(StoreApp.developer),
+        selectinload(StoreApp.reviews).joinedload(AppReview.user),
+        selectinload(StoreApp.screenshots),
+    ).filter_by(slug=slug, status=AppStatus.APPROVED).first_or_404()
+    viewer = current_user()
+    viewer_review = None
+    is_saved = False
+    has_downloaded = False
+    if viewer and viewer.role == UserRole.USER and viewer.status == AccountStatus.APPROVED:
+        viewer_review = AppReview.query.filter_by(user_id=viewer.id, app_id=app_record.id).first()
+        is_saved = SavedApp.query.filter_by(user_id=viewer.id, app_id=app_record.id).first() is not None
+        has_downloaded = DownloadRecord.query.filter_by(user_id=viewer.id, app_id=app_record.id).first() is not None
+    reviews = sorted(
+        app_record.published_reviews,
+        key=lambda review: review.updated_at,
+        reverse=True,
+    )[:20]
+    return render_template(
+        "app_detail.html",
+        app_record=app_record,
+        viewer=viewer,
+        viewer_review=viewer_review,
+        is_saved=is_saved,
+        has_downloaded=has_downloaded,
+        reviews=reviews,
+        report_reasons=ReportReason,
+        csrf_token=get_csrf_token(),
+    )
 
 
 @main.get("/apps/<slug>/download")
@@ -1135,14 +1487,119 @@ def download_app(slug):
     apk_path = private_upload_folder("apks") / app_record.apk_file
     if not apk_path.is_file():
         abort(404)
-    app_record.download_count += 1
-    db.session.commit()
+    viewer = current_user()
+    count_download = False
+    if viewer and viewer.role == UserRole.USER and viewer.status == AccountStatus.APPROVED:
+        existing_download = DownloadRecord.query.filter_by(
+            user_id=viewer.id, app_id=app_record.id, version=app_record.version
+        ).first()
+        if existing_download is None:
+            db.session.add(DownloadRecord(
+                user_id=viewer.id,
+                app_id=app_record.id,
+                version=app_record.version,
+            ))
+            count_download = True
+    else:
+        download_key = f"{app_record.id}:{app_record.version}"
+        counted_downloads = session.get("_counted_downloads", [])
+        if download_key not in counted_downloads:
+            counted_downloads.append(download_key)
+            session["_counted_downloads"] = counted_downloads[-100:]
+            count_download = True
+    if count_download:
+        app_record.download_count += 1
+        db.session.commit()
     return send_private_upload(
         "apks",
         app_record.apk_file,
         download_name=app_record.apk_original_name,
         as_attachment=True,
     )
+
+
+@main.post("/apps/<slug>/save")
+@role_required(UserRole.USER)
+def toggle_saved_app(user, slug):
+    if not valid_csrf_token():
+        abort(400)
+    app_record = StoreApp.query.filter_by(slug=slug, status=AppStatus.APPROVED).first_or_404()
+    saved = SavedApp.query.filter_by(user_id=user.id, app_id=app_record.id).first()
+    if saved:
+        db.session.delete(saved)
+        message = f"{app_record.name} was removed from your saved apps."
+    else:
+        db.session.add(SavedApp(user_id=user.id, app_id=app_record.id))
+        message = f"{app_record.name} was saved to your library."
+    db.session.commit()
+    flash(message, "success")
+    return redirect(url_for("main.app_detail", slug=slug))
+
+
+@main.post("/apps/<slug>/review")
+@role_required(UserRole.USER)
+def review_app(user, slug):
+    if not valid_csrf_token():
+        abort(400)
+    app_record = StoreApp.query.filter_by(slug=slug, status=AppStatus.APPROVED).first_or_404()
+    if not DownloadRecord.query.filter_by(user_id=user.id, app_id=app_record.id).first():
+        flash("Download the app before posting a review.", "warning")
+        return redirect(url_for("main.app_detail", slug=slug))
+    try:
+        rating = int(request.form.get("rating", "0"))
+    except ValueError:
+        rating = 0
+    comment = request.form.get("comment", "").strip()
+    if rating not in range(1, 6):
+        flash("Choose a rating from 1 to 5 stars.", "error")
+    elif len(comment) > 1500:
+        flash("Review text must be 1,500 characters or fewer.", "error")
+    else:
+        review = AppReview.query.filter_by(user_id=user.id, app_id=app_record.id).first()
+        if review is None:
+            review = AppReview(user_id=user.id, app_id=app_record.id)
+            db.session.add(review)
+        review.rating = rating
+        review.comment = comment or None
+        review.status = ReviewStatus.PUBLISHED
+        db.session.commit()
+        flash("Your review was published.", "success")
+    return redirect(url_for("main.app_detail", slug=slug))
+
+
+@main.post("/apps/<slug>/report")
+@role_required(UserRole.USER)
+def report_app(user, slug):
+    if not valid_csrf_token():
+        abort(400)
+    app_record = StoreApp.query.filter_by(slug=slug, status=AppStatus.APPROVED).first_or_404()
+    try:
+        reason = ReportReason(request.form.get("reason", ""))
+    except ValueError:
+        reason = None
+    details = request.form.get("details", "").strip()
+    if reason is None or not 10 <= len(details) <= 2000:
+        flash("Choose a reason and provide 10–2,000 characters of detail.", "error")
+    else:
+        recent_report = AppReport.query.filter_by(
+            user_id=user.id,
+            app_id=app_record.id,
+            status=ReportStatus.OPEN,
+        ).first()
+        if recent_report:
+            flash("You already have an open report for this app.", "warning")
+        else:
+            db.session.add(
+                AppReport(
+                    user_id=user.id,
+                    app_id=app_record.id,
+                    reason=reason,
+                    details=details,
+                )
+            )
+            db.session.commit()
+            flash("Your report was sent to the administrator.", "success")
+    return redirect(url_for("main.app_detail", slug=slug))
 
 
 @main.get("/apps/<int:app_id>/icon")
@@ -1154,7 +1611,7 @@ def app_icon(app_id):
     can_view = app_record.status == AppStatus.APPROVED or (
         viewer
         and (
-            viewer.role == UserRole.ADMIN
+            viewer.role in {UserRole.ADMIN, UserRole.CO_ADMIN}
             or viewer.id == app_record.developer_id
         )
     )
@@ -1172,7 +1629,7 @@ def app_screenshot(screenshot_id):
     can_view = screenshot.app.status == AppStatus.APPROVED or (
         viewer
         and (
-            viewer.role == UserRole.ADMIN
+            viewer.role in {UserRole.ADMIN, UserRole.CO_ADMIN}
             or viewer.id == screenshot.app.developer_id
         )
     )
@@ -1182,13 +1639,18 @@ def app_screenshot(screenshot_id):
 
 
 @main.route("/admin")
-@role_required(UserRole.ADMIN)
+@staff_required
 def admin_dashboard(admin):
+    page = request.args.get("page", 1, type=int)
     query_text = request.args.get("q", "").strip()
     role_filter = request.args.get("role", "all")
     status_filter = request.args.get("status", "all")
 
-    accounts_query = User.query.filter(User.role != UserRole.ADMIN)
+    accounts_query = User.query.options(selectinload(User.developer_profile)).filter(
+        User.role.notin_([UserRole.ADMIN, UserRole.CO_ADMIN])
+    )
+    if admin.role == UserRole.CO_ADMIN:
+        accounts_query = accounts_query.filter(User.role == UserRole.DEVELOPER)
     if query_text:
         search = f"%{query_text.lower()}%"
         accounts_query = accounts_query.filter(
@@ -1203,9 +1665,12 @@ def admin_dashboard(admin):
     if status_filter in {status.value for status in AccountStatus}:
         accounts_query = accounts_query.filter(User.status == AccountStatus(status_filter))
 
-    accounts = accounts_query.order_by(User.created_at.desc(), User.id.desc()).all()
+    pagination = accounts_query.order_by(User.created_at.desc(), User.id.desc()).paginate(
+        page=page, per_page=20, error_out=False
+    )
+    accounts = pagination.items
     counts = {
-        "total": User.query.filter(User.role != UserRole.ADMIN).count(),
+        "total": User.query.filter(User.role.notin_([UserRole.ADMIN, UserRole.CO_ADMIN])).count(),
         "pending": User.query.filter(User.status == AccountStatus.PENDING).count(),
         "developers": User.query.filter(User.role == UserRole.DEVELOPER).count(),
         "blocked": User.query.filter(User.status == AccountStatus.BLOCKED).count(),
@@ -1218,14 +1683,15 @@ def admin_dashboard(admin):
         role_filter=role_filter,
         status_filter=status_filter,
         query_text=query_text,
-        roles=UserRole,
         statuses=AccountStatus,
+        pagination=pagination,
+        pagination_params={key: value for key, value in request.args.items() if key != "page"},
         csrf_token=get_csrf_token(),
     )
 
 
 @main.get("/admin/developers/<int:user_id>")
-@role_required(UserRole.ADMIN)
+@staff_required
 def admin_developer_review(admin, user_id):
     developer = db.session.get(User, user_id)
     if developer is None or developer.role != UserRole.DEVELOPER:
@@ -1240,7 +1706,7 @@ def admin_developer_review(admin, user_id):
 
 
 @main.get("/admin/developers/<int:user_id>/government-id")
-@role_required(UserRole.ADMIN)
+@staff_required
 def admin_developer_government_id(admin, user_id):
     developer = db.session.get(User, user_id)
     if (
@@ -1257,12 +1723,154 @@ def admin_developer_government_id(admin, user_id):
     )
 
 
-@main.get("/admin/apps")
+@main.get("/admin/moderation")
 @role_required(UserRole.ADMIN)
+def admin_moderation(admin):
+    report_status = request.args.get("report_status", ReportStatus.OPEN.value)
+    reports_query = AppReport.query.options(joinedload(AppReport.app), joinedload(AppReport.user))
+    if report_status in {status.value for status in ReportStatus}:
+        reports_query = reports_query.filter(AppReport.status == ReportStatus(report_status))
+    reports = reports_query.order_by(AppReport.created_at.desc()).limit(100).all()
+    reviews = AppReview.query.options(
+        joinedload(AppReview.app), joinedload(AppReview.user)
+    ).order_by(AppReview.updated_at.desc()).limit(100).all()
+    counts = {
+        "open_reports": AppReport.query.filter_by(status=ReportStatus.OPEN).count(),
+        "published_reviews": AppReview.query.filter_by(status=ReviewStatus.PUBLISHED).count(),
+        "hidden_reviews": AppReview.query.filter_by(status=ReviewStatus.HIDDEN).count(),
+    }
+    return render_template(
+        "admin_moderation.html",
+        admin=admin,
+        reports=reports,
+        reviews=reviews,
+        counts=counts,
+        report_status=report_status,
+        report_statuses=ReportStatus,
+        csrf_token=get_csrf_token(),
+    )
+
+
+@main.get("/admin/audit-log")
+@role_required(UserRole.ADMIN)
+def admin_audit_log(admin):
+    page = request.args.get("page", 1, type=int)
+    action_value = request.args.get("action", "all")
+    logs_query = AuditLog.query.options(joinedload(AuditLog.admin))
+    if action_value in {action.value for action in AuditAction}:
+        logs_query = logs_query.filter(AuditLog.action == AuditAction(action_value))
+    pagination = logs_query.order_by(AuditLog.created_at.desc(), AuditLog.id.desc()).paginate(
+        page=page, per_page=30, error_out=False
+    )
+
+
+@main.route("/admin/co-admins", methods=["GET", "POST"])
+@role_required(UserRole.ADMIN)
+def admin_co_admins(admin):
+    if request.method == "POST":
+        if not valid_csrf_token():
+            abort(400)
+        username = request.form.get("username", "").strip()
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        errors = []
+        if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", username):
+            errors.append("Username must be 3–30 characters using letters, numbers, or underscores.")
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+            errors.append("Enter a valid email address.")
+        if len(password) < 12 or not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
+            errors.append("Temporary password must be at least 12 characters with a letter and number.")
+        if username_index.contains(username):
+            errors.append("That username is already in use.")
+        if User.query.filter(func.lower(User.email) == email).first():
+            errors.append("That email address is already in use.")
+        if errors:
+            for error in errors:
+                flash(error, "error")
+        else:
+            co_admin = User(username=username, email=email, role=UserRole.CO_ADMIN, status=AccountStatus.APPROVED)
+            co_admin.set_password(password)
+            co_admin.approve()
+            db.session.add(co_admin)
+            db.session.flush()
+            record_admin_audit(admin, AuditAction.CO_ADMIN_MANAGEMENT, "create", "co_admin", co_admin.id, username)
+            db.session.commit()
+            username_index.add(co_admin.username, co_admin.id)
+            flash(f"Co-admin {username} was created.", "success")
+            return redirect(url_for("main.admin_co_admins"))
+    co_admins = User.query.filter_by(role=UserRole.CO_ADMIN).order_by(User.created_at.desc()).all()
+    return render_template("admin_co_admins.html", admin=admin, co_admins=co_admins, csrf_token=get_csrf_token())
+
+
+@main.post("/admin/co-admins/<int:user_id>/toggle")
+@role_required(UserRole.ADMIN)
+def toggle_co_admin(admin, user_id):
+    if not valid_csrf_token():
+        abort(400)
+    co_admin = db.session.get(User, user_id)
+    if co_admin is None or co_admin.role != UserRole.CO_ADMIN:
+        abort(404)
+    enabling = co_admin.status == AccountStatus.BLOCKED
+    if enabling:
+        co_admin.unblock()
+    else:
+        co_admin.block()
+    operation = "enable" if enabling else "disable"
+    record_admin_audit(admin, AuditAction.CO_ADMIN_MANAGEMENT, operation, "co_admin", co_admin.id, co_admin.username)
+    db.session.commit()
+    flash(f"Co-admin {co_admin.username} was {operation}d.", "success")
+    return redirect(url_for("main.admin_co_admins"))
+    return render_template(
+        "admin_audit_log.html", admin=admin, logs=pagination.items,
+        pagination=pagination, pagination_params={"action": action_value},
+        actions=AuditAction, action_value=action_value, csrf_token=get_csrf_token(),
+    )
+
+
+@main.post("/admin/reports/<int:report_id>/<action>")
+@role_required(UserRole.ADMIN)
+def manage_report(admin, report_id, action):
+    if not valid_csrf_token():
+        abort(400)
+    report = db.session.get(AppReport, report_id)
+    if report is None or action not in {"resolve", "dismiss"}:
+        abort(404)
+    report.status = ReportStatus.RESOLVED if action == "resolve" else ReportStatus.DISMISSED
+    report.admin_note = request.form.get("admin_note", "").strip() or None
+    report.resolved_at = datetime.now(timezone.utc)
+    record_admin_audit(admin, AuditAction.REPORT_MODERATION, action, "report", report.id, report.app.name, report.admin_note)
+    db.session.commit()
+    flash(f"Report #{report.id} was {report.status.value}.", "success")
+    return redirect(url_for("main.admin_moderation"))
+
+
+@main.post("/admin/reviews/<int:review_id>/<action>")
+@role_required(UserRole.ADMIN)
+def manage_review(admin, review_id, action):
+    if not valid_csrf_token():
+        abort(400)
+    review = db.session.get(AppReview, review_id)
+    if review is None or action not in {"hide", "publish", "delete"}:
+        abort(404)
+    target_label = f"{review.app.name} review by {review.user.username}"
+    if action == "delete":
+        db.session.delete(review)
+    else:
+        review.status = ReviewStatus.HIDDEN if action == "hide" else ReviewStatus.PUBLISHED
+    record_admin_audit(admin, AuditAction.REVIEW_MODERATION, action, "review", review_id, target_label)
+    db.session.commit()
+    labels = {"hide": "hidden", "publish": "published", "delete": "deleted"}
+    flash(f"Review was {labels[action]}.", "success")
+    return redirect(url_for("main.admin_moderation"))
+
+
+@main.get("/admin/apps")
+@staff_required
 def admin_apps(admin):
+    page = request.args.get("page", 1, type=int)
     status_value = request.args.get("status", "all")
     query_text = request.args.get("q", "").strip()
-    apps_query = StoreApp.query
+    apps_query = StoreApp.query.options(joinedload(StoreApp.developer))
     if status_value == AppStatus.PENDING.value:
         apps_query = apps_query.filter(
             or_(
@@ -1281,7 +1889,10 @@ def admin_apps(admin):
                 func.lower(User.username).like(search),
             )
         )
-    apps = apps_query.order_by(StoreApp.submitted_at.desc(), StoreApp.id.desc()).all()
+    pagination = apps_query.order_by(StoreApp.submitted_at.desc(), StoreApp.id.desc()).paginate(
+        page=page, per_page=20, error_out=False
+    )
+    apps = pagination.items
     counts = {
         "total": StoreApp.query.count(),
         "pending": StoreApp.query.filter(
@@ -1299,6 +1910,8 @@ def admin_apps(admin):
         apps=apps,
         counts=counts,
         statuses=AppStatus,
+        pagination=pagination,
+        pagination_params={key: value for key, value in request.args.items() if key != "page"},
         status_value=status_value,
         query_text=query_text,
         csrf_token=get_csrf_token(),
@@ -1306,7 +1919,7 @@ def admin_apps(admin):
 
 
 @main.get("/admin/apps/<int:app_id>")
-@role_required(UserRole.ADMIN)
+@staff_required
 def admin_app_review(admin, app_id):
     app_record = db.session.get(StoreApp, app_id)
     if app_record is None:
@@ -1320,7 +1933,7 @@ def admin_app_review(admin, app_id):
 
 
 @main.get("/admin/apps/<int:app_id>/apk")
-@role_required(UserRole.ADMIN)
+@staff_required
 def admin_download_apk(admin, app_id):
     app_record = db.session.get(StoreApp, app_id)
     if app_record is None:
@@ -1334,7 +1947,7 @@ def admin_download_apk(admin, app_id):
 
 
 @main.get("/admin/apps/<int:app_id>/pending-apk")
-@role_required(UserRole.ADMIN)
+@staff_required
 def admin_download_pending_apk(admin, app_id):
     app_record = db.session.get(StoreApp, app_id)
     if app_record is None or not app_record.pending_apk_file:
@@ -1348,7 +1961,7 @@ def admin_download_pending_apk(admin, app_id):
 
 
 @main.post("/admin/apps/<int:app_id>/release/<action>")
-@role_required(UserRole.ADMIN)
+@staff_required
 def manage_app_release(admin, app_id, action):
     if not valid_csrf_token():
         flash("Your session expired. Please try again.", "error")
@@ -1366,6 +1979,9 @@ def manage_app_release(admin, app_id, action):
             return redirect(url_for("main.admin_app_review", app_id=app_id))
         if app_record.pending_security_scan_status != SecurityScanStatus.PASSED:
             flash("This version must pass structural safety checks before approval.", "error")
+            return redirect(url_for("main.admin_app_review", app_id=app_id))
+        if app_record.pending_malware_scan_status != SecurityScanStatus.PASSED:
+            flash("This version must pass malware scanning before approval.", "error")
             return redirect(url_for("main.admin_app_review", app_id=app_id))
         previous = AppVersionHistory(
             app=app_record,
@@ -1389,6 +2005,9 @@ def manage_app_release(admin, app_id, action):
         app_record.security_scan_status = app_record.pending_security_scan_status
         app_record.security_scan_summary = app_record.pending_security_scan_summary
         app_record.security_scanned_at = app_record.pending_security_scanned_at
+        app_record.malware_scan_status = app_record.pending_malware_scan_status
+        app_record.malware_scan_summary = app_record.pending_malware_scan_summary
+        app_record.malware_scanned_at = app_record.pending_malware_scanned_at
         app_record.approved_at = datetime.now(timezone.utc)
         app_record.clear_pending_release()
         message = f"Version {version} of {app_record.name} was published."
@@ -1400,6 +2019,21 @@ def manage_app_release(admin, app_id, action):
         message = f"Version {version} of {app_record.name} was rejected."
         status_value = "rejected"
 
+    create_notification(
+        app_record.developer_id, NotificationType.RELEASE,
+        f"{app_record.name} version {version} {status_value}",
+        message, url_for("main.developer_dashboard"),
+    )
+    if action == "approve":
+        saved_user_ids = db.session.query(SavedApp.user_id).filter_by(app_id=app_id).all()
+        for (saved_user_id,) in saved_user_ids:
+            create_notification(
+                saved_user_id, NotificationType.RELEASE,
+                f"{app_record.name} {version} is available",
+                "A new administrator-approved version is ready to download.",
+                url_for("main.app_detail", slug=app_record.slug),
+            )
+    record_admin_audit(admin, AuditAction.RELEASE_MODERATION, action, "release", app_id, f"{app_record.name} v{version}", request.form.get("review_note", "").strip())
     db.session.commit()
     event = account_events.publish(
         {
@@ -1419,7 +2053,7 @@ def manage_app_release(admin, app_id, action):
 
 
 @main.post("/admin/apps/<int:app_id>/<action>")
-@role_required(UserRole.ADMIN)
+@staff_required
 def manage_app(admin, app_id, action):
     if not valid_csrf_token():
         flash("Your session expired. Please try again.", "error")
@@ -1429,12 +2063,22 @@ def manage_app(admin, app_id, action):
         abort(404)
     if action not in {"approve", "reject", "block", "delete"}:
         abort(404)
+    if admin.role == UserRole.CO_ADMIN and action not in {"approve", "reject"}:
+        abort(403)
     if action == "approve" and app_record.developer.status != AccountStatus.APPROVED:
         flash("Approve the developer account before approving this app.", "error")
         return redirect(url_for("main.admin_app_review", app_id=app_id))
     if action == "approve" and app_record.security_scan_status != SecurityScanStatus.PASSED:
         flash("This APK must pass structural safety checks before approval.", "error")
         return redirect(url_for("main.admin_app_review", app_id=app_id))
+    if action == "approve" and app_record.malware_scan_status != SecurityScanStatus.PASSED:
+        flash("This APK must pass malware scanning before approval.", "error")
+        return redirect(url_for("main.admin_app_review", app_id=app_id))
+
+    action_labels = {
+        "approve": "approved", "reject": "rejected",
+        "block": "blocked", "delete": "deleted",
+    }
 
     review_note = request.form.get("review_note", "").strip()
     app_name = app_record.name
@@ -1463,6 +2107,12 @@ def manage_app(admin, app_id, action):
         )
         db.session.delete(app_record)
 
+    create_notification(
+        developer_id, NotificationType.APP, f"{app_name} {action_labels[action]}",
+        review_note or f"The administrator {action_labels[action]} your app submission.",
+        url_for("main.developer_dashboard"),
+    )
+    record_admin_audit(admin, AuditAction.APP_MODERATION, action, "app", app_id, app_name, review_note)
     db.session.commit()
     if action == "delete":
         for folder, filename in cleanup_files:
@@ -1480,12 +2130,6 @@ def manage_app(admin, app_id, action):
             "status": status_value,
         }
     )
-    action_labels = {
-        "approve": "approved",
-        "reject": "rejected",
-        "block": "blocked",
-        "delete": "deleted",
-    }
     message = f"{app_name} was {action_labels[action]}."
     if request.headers.get("X-Requested-With") == "fetch":
         return jsonify({"ok": True, "message": message, "event": event})
@@ -1521,7 +2165,7 @@ def server_event_response(event_filter):
 
 
 @main.get("/events/admin-accounts")
-@role_required(UserRole.ADMIN)
+@staff_required
 def admin_account_events(admin):
     return server_event_response(
         lambda event: event.get("type", "").startswith("account_")
@@ -1529,7 +2173,7 @@ def admin_account_events(admin):
 
 
 @main.get("/events/admin-apps")
-@role_required(UserRole.ADMIN)
+@staff_required
 def admin_app_events(admin):
     return server_event_response(
         lambda event: event.get("type", "").startswith(("app_", "release_"))
@@ -1571,7 +2215,7 @@ def account_access_changed():
 
 
 @main.post("/admin/accounts/<int:user_id>/<action>")
-@role_required(UserRole.ADMIN)
+@staff_required
 def manage_account(admin, user_id, action):
     if not valid_csrf_token():
         flash("Your session expired. Please try again.", "error")
@@ -1580,7 +2224,7 @@ def manage_account(admin, user_id, action):
     account = db.session.get(User, user_id)
     if account is None:
         abort(404)
-    if account.role == UserRole.ADMIN or account.id == admin.id:
+    if account.role in {UserRole.ADMIN, UserRole.CO_ADMIN} or account.id == admin.id:
         flash("Administrator accounts cannot be changed here.", "error")
         return redirect(url_for("main.admin_dashboard"))
 
@@ -1593,6 +2237,10 @@ def manage_account(admin, user_id, action):
     }
     if action not in labels:
         abort(404)
+    if admin.role == UserRole.CO_ADMIN and (
+        account.role != UserRole.DEVELOPER or action not in {"approve", "reject"}
+    ):
+        abort(403)
 
     if (
         action == "approve"
@@ -1602,7 +2250,10 @@ def manage_account(admin, user_id, action):
             or not account.developer_profile.is_submitted
         )
     ):
-        flash("The developer must submit identity details before approval.", "error")
+        message = "The developer must sign in and submit all identity details before approval."
+        if request.headers.get("X-Requested-With") == "fetch":
+            return jsonify({"ok": False, "message": message}), 409
+        flash(message, "error")
         return redirect(url_for("main.admin_developer_review", user_id=account.id))
 
     username = account.username
@@ -1655,6 +2306,13 @@ def manage_account(admin, user_id, action):
             )
         db.session.delete(account)
 
+    if action != "delete":
+        create_notification(
+            user_id, NotificationType.ACCOUNT, f"Account {labels[action]}",
+            review_note or f"Your {role_value} account was {labels[action]} by an administrator.",
+            url_for("main.developer_dashboard") if role_value == UserRole.DEVELOPER.value else url_for("main.user_dashboard"),
+        )
+    record_admin_audit(admin, AuditAction.ACCOUNT_MODERATION, action, "account", user_id, username, review_note)
     db.session.commit()
     if action == "delete":
         username_index.remove(username)
@@ -1685,11 +2343,122 @@ def manage_account(admin, user_id, action):
 @main.route("/user/dashboard")
 @role_required(UserRole.USER)
 def user_dashboard(user):
+    download_records = DownloadRecord.query.options(joinedload(DownloadRecord.app)).filter_by(user_id=user.id).order_by(
+        DownloadRecord.downloaded_at.desc()
+    ).all()
+    recent_downloads = []
+    seen_app_ids = set()
+    for record in download_records:
+        if record.app_id not in seen_app_ids:
+            recent_downloads.append(record)
+            seen_app_ids.add(record.app_id)
+    saved_apps = SavedApp.query.options(joinedload(SavedApp.app)).filter_by(user_id=user.id).order_by(
+        SavedApp.created_at.desc()
+    ).all()
+    reviews = AppReview.query.options(joinedload(AppReview.app)).filter_by(user_id=user.id).order_by(
+        AppReview.updated_at.desc()
+    ).all()
     return render_template(
         "user_dashboard.html",
         user=user,
+        recent_downloads=recent_downloads,
+        download_count=len(download_records),
+        saved_apps=saved_apps,
+        reviews=reviews,
         csrf_token=get_csrf_token(),
     )
+
+
+@main.route("/account/settings", methods=["GET", "POST"])
+def account_settings():
+    user = current_user()
+    if user is None or user.role == UserRole.ADMIN or user.status != AccountStatus.APPROVED:
+        session.clear()
+        flash("Sign in to manage your account.", "error")
+        return redirect(url_for("main.account_login", role_name="user"))
+
+    if request.method == "POST":
+        if not valid_csrf_token():
+            abort(400)
+        email = request.form.get("email", "").strip().lower()
+        company_name = request.form.get("company_name", "").strip()
+        current_password = request.form.get("current_password", "")
+        new_password = request.form.get("new_password", "")
+        confirm_password = request.form.get("confirm_password", "")
+        errors = []
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+            errors.append("Enter a valid email address.")
+        elif User.query.filter(func.lower(User.email) == email, User.id != user.id).first():
+            errors.append("That email address is already in use.")
+        if user.role == UserRole.DEVELOPER and not company_name:
+            errors.append("Enter your developer or company name.")
+        if new_password or confirm_password or current_password:
+            if not user.check_password(current_password):
+                errors.append("Your current password is incorrect.")
+            elif len(new_password) < 8:
+                errors.append("The new password must contain at least 8 characters.")
+            elif new_password != confirm_password:
+                errors.append("The new passwords do not match.")
+        if errors:
+            for error in errors:
+                flash(error, "error")
+        else:
+            user.email = email
+            if user.role == UserRole.DEVELOPER:
+                user.company_name = company_name
+            if new_password:
+                user.set_password(new_password)
+            try:
+                db.session.commit()
+                flash("Your account settings were updated.", "success")
+                return redirect(url_for("main.account_settings"))
+            except IntegrityError:
+                db.session.rollback()
+                flash("That email address is already in use.", "error")
+
+    return render_template(
+        "account_settings.html",
+        user=user,
+        csrf_token=get_csrf_token(),
+    )
+
+
+@main.get("/notifications")
+def notifications():
+    user = current_user()
+    if user is None or user.role == UserRole.ADMIN or user.status != AccountStatus.APPROVED:
+        flash("Sign in to view notifications.", "error")
+        return redirect(url_for("main.account_login", role_name="user"))
+    items = Notification.query.filter_by(recipient_id=user.id).order_by(
+        Notification.created_at.desc(), Notification.id.desc()
+    ).limit(100).all()
+    return render_template("notifications.html", user=user, notifications=items, csrf_token=get_csrf_token())
+
+
+@main.post("/notifications/read-all")
+def read_all_notifications():
+    user = current_user()
+    if user is None or user.role == UserRole.ADMIN or user.status != AccountStatus.APPROVED:
+        abort(403)
+    if not valid_csrf_token():
+        abort(400)
+    Notification.query.filter_by(recipient_id=user.id, is_read=False).update({"is_read": True})
+    db.session.commit()
+    return redirect(url_for("main.notifications"))
+
+
+@main.post("/notifications/<int:notification_id>/open")
+def open_notification(notification_id):
+    user = current_user()
+    if user is None or user.role == UserRole.ADMIN or user.status != AccountStatus.APPROVED:
+        abort(403)
+    if not valid_csrf_token():
+        abort(400)
+    item = Notification.query.filter_by(id=notification_id, recipient_id=user.id).first_or_404()
+    item.is_read = True
+    db.session.commit()
+    safe_link = item.link if item.link and item.link.startswith("/") and not item.link.startswith("//") else dashboard_url_for(user)
+    return redirect(safe_link)
 
 
 @main.route("/developer/dashboard")
@@ -1698,7 +2467,7 @@ def developer_dashboard(user):
     if not user.developer_profile or not user.developer_profile.is_submitted:
         flash("Complete identity verification before using the developer studio.", "warning")
         return redirect(url_for("main.developer_verification"))
-    apps = StoreApp.query.filter_by(developer_id=user.id).order_by(
+    apps = StoreApp.query.options(selectinload(StoreApp.reviews)).filter_by(developer_id=user.id).order_by(
         StoreApp.submitted_at.desc(),
         StoreApp.id.desc(),
     ).all()
@@ -1706,12 +2475,40 @@ def developer_dashboard(user):
         "published": sum(app.status == AppStatus.APPROVED for app in apps),
         "pending": sum(app.status == AppStatus.PENDING for app in apps),
         "downloads": sum(app.download_count for app in apps),
+        "reviews": sum(app.review_count for app in apps),
     }
+    approved_app_ids = [app.id for app in apps if app.status == AppStatus.APPROVED]
+    recent_downloads = []
+    seven_day_downloads = []
+    if approved_app_ids:
+        recent_downloads = DownloadRecord.query.options(joinedload(DownloadRecord.app)).filter(
+            DownloadRecord.app_id.in_(approved_app_ids)
+        ).order_by(DownloadRecord.downloaded_at.desc()).limit(10).all()
+        start_day = (datetime.now(timezone.utc) - timedelta(days=6)).date()
+        tracked = DownloadRecord.query.filter(
+            DownloadRecord.app_id.in_(approved_app_ids),
+            DownloadRecord.downloaded_at >= datetime.combine(start_day, datetime.min.time(), tzinfo=timezone.utc),
+        ).all()
+        downloads_by_day = {}
+        for record in tracked:
+            day = aware_datetime(record.downloaded_at).date()
+            downloads_by_day[day] = downloads_by_day.get(day, 0) + 1
+        seven_day_downloads = [
+            {
+                "date": start_day + timedelta(days=offset),
+                "count": downloads_by_day.get(start_day + timedelta(days=offset), 0),
+            }
+            for offset in range(7)
+        ]
+    max_daily_downloads = max((item["count"] for item in seven_day_downloads), default=0)
     return render_template(
         "developer_dashboard.html",
         user=user,
         apps=apps,
         app_counts=app_counts,
+        recent_downloads=recent_downloads,
+        seven_day_downloads=seven_day_downloads,
+        max_daily_downloads=max_daily_downloads,
         csrf_token=get_csrf_token(),
     )
 
@@ -1721,8 +2518,3 @@ def logout():
     if valid_csrf_token():
         session.clear()
     return redirect(url_for("main.home"))
-
-
-@main.post("/admin/logout")
-def legacy_admin_logout():
-    return logout()

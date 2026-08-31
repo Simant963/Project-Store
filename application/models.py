@@ -8,6 +8,7 @@ from .database import db
 
 class UserRole(str, Enum):
     ADMIN = "admin"
+    CO_ADMIN = "co_admin"
     USER = "user"
     DEVELOPER = "developer"
 
@@ -58,6 +59,41 @@ class SecurityScanStatus(str, Enum):
     FAILED = "failed"
 
 
+class ReviewStatus(str, Enum):
+    PUBLISHED = "published"
+    HIDDEN = "hidden"
+
+
+class ReportReason(str, Enum):
+    MALWARE = "malware"
+    PRIVACY = "privacy"
+    INAPPROPRIATE = "inappropriate"
+    COPYRIGHT = "copyright"
+    MISLEADING = "misleading"
+    OTHER = "other"
+
+
+class ReportStatus(str, Enum):
+    OPEN = "open"
+    RESOLVED = "resolved"
+    DISMISSED = "dismissed"
+
+
+class AuditAction(str, Enum):
+    CO_ADMIN_MANAGEMENT = "co_admin_management"
+    ACCOUNT_MODERATION = "account_moderation"
+    APP_MODERATION = "app_moderation"
+    RELEASE_MODERATION = "release_moderation"
+    REPORT_MODERATION = "report_moderation"
+    REVIEW_MODERATION = "review_moderation"
+
+
+class NotificationType(str, Enum):
+    ACCOUNT = "account"
+    APP = "app"
+    RELEASE = "release"
+
+
 class AgeRating(str, Enum):
     EVERYONE = "everyone"
     TEEN = "teen"
@@ -66,6 +102,28 @@ class AgeRating(str, Enum):
 
 def enum_values(enum_class):
     return [member.value for member in enum_class]
+
+
+def format_file_size(byte_count):
+    if byte_count is None:
+        return "—"
+    size = float(byte_count)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+
+
+class SchemaVersion(db.Model):
+    __tablename__ = "schema_version"
+
+    id = db.Column(db.Integer, primary_key=True, default=1)
+    version = db.Column(db.Integer, nullable=False)
+    updated_at = db.Column(
+        db.DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
 
 
 class User(db.Model):
@@ -117,6 +175,11 @@ class User(db.Model):
         cascade="all, delete-orphan",
         order_by="StoreApp.created_at.desc()",
     )
+    saved_apps = db.relationship("SavedApp", back_populates="user", cascade="all, delete-orphan")
+    downloads = db.relationship("DownloadRecord", back_populates="user", cascade="all, delete-orphan")
+    reviews = db.relationship("AppReview", back_populates="user", cascade="all, delete-orphan")
+    reports = db.relationship("AppReport", back_populates="user", cascade="all, delete-orphan")
+    notifications = db.relationship("Notification", back_populates="recipient", cascade="all, delete-orphan")
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
@@ -259,6 +322,9 @@ class StoreApp(db.Model):
     )
     security_scan_summary = db.Column(db.Text, nullable=True)
     security_scanned_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    malware_scan_status = db.Column(db.Enum(SecurityScanStatus, values_callable=enum_values, native_enum=False, validate_strings=True, length=20), nullable=False, default=SecurityScanStatus.UNSCANNED)
+    malware_scan_summary = db.Column(db.Text, nullable=True)
+    malware_scanned_at = db.Column(db.DateTime(timezone=True), nullable=True)
     pending_version = db.Column(db.String(40), nullable=True)
     pending_min_android_version = db.Column(db.String(40), nullable=True)
     pending_changelog = db.Column(db.Text, nullable=True)
@@ -278,6 +344,9 @@ class StoreApp(db.Model):
     )
     pending_security_scan_summary = db.Column(db.Text, nullable=True)
     pending_security_scanned_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    pending_malware_scan_status = db.Column(db.Enum(SecurityScanStatus, values_callable=enum_values, native_enum=False, validate_strings=True, length=20), nullable=True)
+    pending_malware_scan_summary = db.Column(db.Text, nullable=True)
+    pending_malware_scanned_at = db.Column(db.DateTime(timezone=True), nullable=True)
     pending_release_status = db.Column(
         db.Enum(
             ReleaseStatus,
@@ -336,6 +405,10 @@ class StoreApp(db.Model):
         cascade="all, delete-orphan",
         order_by="AppScreenshot.position.asc()",
     )
+    saved_by = db.relationship("SavedApp", back_populates="app", cascade="all, delete-orphan")
+    download_records = db.relationship("DownloadRecord", back_populates="app", cascade="all, delete-orphan")
+    reviews = db.relationship("AppReview", back_populates="app", cascade="all, delete-orphan")
+    reports = db.relationship("AppReport", back_populates="app", cascade="all, delete-orphan")
 
     @property
     def category_label(self):
@@ -347,25 +420,30 @@ class StoreApp(db.Model):
 
     @property
     def formatted_size(self):
-        size = float(self.apk_size)
-        for unit in ("B", "KB", "MB", "GB"):
-            if size < 1024 or unit == "GB":
-                return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
-            size /= 1024
+        return format_file_size(self.apk_size)
 
     @property
     def pending_formatted_size(self):
-        if self.pending_apk_size is None:
-            return "—"
-        size = float(self.pending_apk_size)
-        for unit in ("B", "KB", "MB", "GB"):
-            if size < 1024 or unit == "GB":
-                return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
-            size /= 1024
+        return format_file_size(self.pending_apk_size)
 
     @property
     def has_pending_release(self):
         return self.pending_release_status == ReleaseStatus.PENDING
+
+    @property
+    def published_reviews(self):
+        return [review for review in self.reviews if review.status == ReviewStatus.PUBLISHED]
+
+    @property
+    def review_count(self):
+        return len(self.published_reviews)
+
+    @property
+    def average_rating(self):
+        reviews = self.published_reviews
+        if not reviews:
+            return None
+        return round(sum(review.rating for review in reviews) / len(reviews), 1)
 
     def approve(self):
         self.status = AppStatus.APPROVED
@@ -392,6 +470,9 @@ class StoreApp(db.Model):
         self.pending_security_scan_status = None
         self.pending_security_scan_summary = None
         self.pending_security_scanned_at = None
+        self.pending_malware_scan_status = None
+        self.pending_malware_scan_summary = None
+        self.pending_malware_scanned_at = None
         self.pending_release_status = None
         self.pending_release_note = None
         self.pending_release_submitted_at = None
@@ -425,11 +506,7 @@ class AppVersionHistory(db.Model):
 
     @property
     def formatted_size(self):
-        size = float(self.apk_size)
-        for unit in ("B", "KB", "MB", "GB"):
-            if size < 1024 or unit == "GB":
-                return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
-            size /= 1024
+        return format_file_size(self.apk_size)
 
 
 class AppScreenshot(db.Model):
@@ -452,3 +529,139 @@ class AppScreenshot(db.Model):
     )
 
     app = db.relationship("StoreApp", back_populates="screenshots")
+
+
+class PasswordResetToken(db.Model):
+    __tablename__ = "password_reset_token"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(
+        db.Integer,
+        db.ForeignKey("user.id"),
+        nullable=False,
+        index=True,
+    )
+    token_hash = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    expires_at = db.Column(db.DateTime(timezone=True), nullable=False, index=True)
+    used_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    created_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    user = db.relationship("User")
+
+    @property
+    def is_valid(self):
+        expires = self.expires_at
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return self.used_at is None and expires > datetime.now(timezone.utc)
+
+
+class LoginThrottle(db.Model):
+    __tablename__ = "login_throttle"
+
+    id = db.Column(db.Integer, primary_key=True)
+    key_hash = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    attempts = db.Column(db.Integer, nullable=False, default=0)
+    window_started_at = db.Column(db.DateTime(timezone=True), nullable=False)
+    locked_until = db.Column(db.DateTime(timezone=True), nullable=True)
+    updated_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class SavedApp(db.Model):
+    __tablename__ = "saved_app"
+    __table_args__ = (db.UniqueConstraint("user_id", "app_id", name="uq_saved_app_user_app"),)
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    app_id = db.Column(db.Integer, db.ForeignKey("store_app.id"), nullable=False, index=True)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    user = db.relationship("User", back_populates="saved_apps")
+    app = db.relationship("StoreApp", back_populates="saved_by")
+
+
+class DownloadRecord(db.Model):
+    __tablename__ = "download_record"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    app_id = db.Column(db.Integer, db.ForeignKey("store_app.id"), nullable=False, index=True)
+    version = db.Column(db.String(40), nullable=False)
+    downloaded_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+    user = db.relationship("User", back_populates="downloads")
+    app = db.relationship("StoreApp", back_populates="download_records")
+
+
+class AppReview(db.Model):
+    __tablename__ = "app_review"
+    __table_args__ = (
+        db.UniqueConstraint("user_id", "app_id", name="uq_app_review_user_app"),
+        db.CheckConstraint("rating >= 1 AND rating <= 5", name="ck_app_review_rating"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    app_id = db.Column(db.Integer, db.ForeignKey("store_app.id"), nullable=False, index=True)
+    rating = db.Column(db.Integer, nullable=False)
+    comment = db.Column(db.Text, nullable=True)
+    status = db.Column(db.Enum(ReviewStatus, values_callable=enum_values, native_enum=False, validate_strings=True, length=20), nullable=False, default=ReviewStatus.PUBLISHED, index=True)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    updated_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    user = db.relationship("User", back_populates="reviews")
+    app = db.relationship("StoreApp", back_populates="reviews")
+
+
+class AppReport(db.Model):
+    __tablename__ = "app_report"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    app_id = db.Column(db.Integer, db.ForeignKey("store_app.id"), nullable=False, index=True)
+    reason = db.Column(db.Enum(ReportReason, values_callable=enum_values, native_enum=False, validate_strings=True, length=30), nullable=False)
+    details = db.Column(db.Text, nullable=False)
+    status = db.Column(db.Enum(ReportStatus, values_callable=enum_values, native_enum=False, validate_strings=True, length=20), nullable=False, default=ReportStatus.OPEN, index=True)
+    admin_note = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+    resolved_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    user = db.relationship("User", back_populates="reports")
+    app = db.relationship("StoreApp", back_populates="reports")
+
+
+class AuditLog(db.Model):
+    __tablename__ = "audit_log"
+
+    id = db.Column(db.Integer, primary_key=True)
+    admin_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    action = db.Column(db.Enum(AuditAction, values_callable=enum_values, native_enum=False, validate_strings=True, length=40), nullable=False, index=True)
+    operation = db.Column(db.String(30), nullable=False)
+    target_type = db.Column(db.String(30), nullable=False, index=True)
+    target_id = db.Column(db.Integer, nullable=True)
+    target_label = db.Column(db.String(180), nullable=False)
+    note = db.Column(db.Text, nullable=True)
+    ip_address = db.Column(db.String(64), nullable=True)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+
+    admin = db.relationship("User", foreign_keys=[admin_id])
+
+
+class Notification(db.Model):
+    __tablename__ = "notification"
+
+    id = db.Column(db.Integer, primary_key=True)
+    recipient_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    type = db.Column(db.Enum(NotificationType, values_callable=enum_values, native_enum=False, validate_strings=True, length=20), nullable=False, index=True)
+    title = db.Column(db.String(160), nullable=False)
+    message = db.Column(db.Text, nullable=False)
+    link = db.Column(db.String(255), nullable=True)
+    is_read = db.Column(db.Boolean, nullable=False, default=False, index=True)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
+
+    recipient = db.relationship("User", back_populates="notifications")
