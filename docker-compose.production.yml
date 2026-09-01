@@ -1,0 +1,82 @@
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  clamav-updater:
+    build: .
+    restart: unless-stopped
+    user: root
+    command: ["freshclam", "--daemon", "--foreground=true"]
+    volumes:
+      - clamav_data:/var/lib/clamav
+
+  init-storage:
+    build: .
+    user: root
+    command: ["sh", "-c", "mkdir -p /data/appora/uploads && chown -R 10001:10001 /data/appora/uploads"]
+    volumes:
+      - private_uploads:/data/appora/uploads
+    restart: "no"
+
+  migrate:
+    build: .
+    env_file: .env.production
+    command: ["flask", "--app", "app", "db", "upgrade"]
+    depends_on:
+      db:
+        condition: service_healthy
+      init-storage:
+        condition: service_completed_successfully
+    volumes:
+      - private_uploads:/data/appora/uploads
+      - clamav_data:/var/lib/clamav:ro
+    restart: "no"
+
+  web:
+    build: .
+    restart: unless-stopped
+    env_file: .env.production
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - private_uploads:/data/appora/uploads
+      - clamav_data:/var/lib/clamav:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=5)"]
+      interval: 30s
+      timeout: 8s
+      retries: 5
+      start_period: 30s
+
+  proxy:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deployment/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deployment/certs:/etc/nginx/certs:ro
+
+volumes:
+  postgres_data:
+  private_uploads:
+  clamav_data:

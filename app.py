@@ -1,96 +1,21 @@
 import os
 import secrets
+import shutil
 from datetime import timedelta
 from pathlib import Path
 
+import click
 from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, render_template, request
+from alembic.migration import MigrationContext
+from alembic.script import ScriptDirectory
+from flask_migrate import upgrade
 from sqlalchemy import inspect, text
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from application.database import db
+from application.database import db, migrate
 
 load_dotenv()
-
-
-def upgrade_existing_user_table():
-    """Add new account fields without deleting existing local data."""
-    inspector = inspect(db.engine)
-    if "user" not in inspector.get_table_names():
-        return
-
-    columns = {column["name"] for column in inspector.get_columns("user")}
-    datetime_type = "TIMESTAMP WITH TIME ZONE" if db.engine.dialect.name == "postgresql" else "DATETIME"
-    additions = {
-        "status": "ALTER TABLE user ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'approved'",
-        "company_name": "ALTER TABLE user ADD COLUMN company_name VARCHAR(120)",
-        "created_at": f"ALTER TABLE user ADD COLUMN created_at {datetime_type}",
-        "approved_at": f"ALTER TABLE user ADD COLUMN approved_at {datetime_type}",
-        "last_login_at": f"ALTER TABLE user ADD COLUMN last_login_at {datetime_type}",
-    }
-
-    for name, statement in additions.items():
-        if name not in columns:
-            db.session.execute(text(statement))
-
-    db.session.execute(
-        text("UPDATE user SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
-    )
-    db.session.execute(
-        text(
-            "CREATE INDEX IF NOT EXISTS idx_user_role_status "
-            "ON user (role, status)"
-        )
-    )
-    if db.engine.dialect.name == "sqlite":
-        db.session.execute(text("PRAGMA optimize"))
-
-
-def upgrade_existing_store_app_table():
-    """Add release-review fields without replacing existing app records."""
-    inspector = inspect(db.engine)
-    if "store_app" not in inspector.get_table_names():
-        return
-
-    columns = {column["name"] for column in inspector.get_columns("store_app")}
-    datetime_type = "TIMESTAMP WITH TIME ZONE" if db.engine.dialect.name == "postgresql" else "DATETIME"
-    additions = {
-        "pending_version": "ALTER TABLE store_app ADD COLUMN pending_version VARCHAR(40)",
-        "pending_min_android_version": "ALTER TABLE store_app ADD COLUMN pending_min_android_version VARCHAR(40)",
-        "pending_changelog": "ALTER TABLE store_app ADD COLUMN pending_changelog TEXT",
-        "pending_apk_file": "ALTER TABLE store_app ADD COLUMN pending_apk_file VARCHAR(255)",
-        "pending_apk_original_name": "ALTER TABLE store_app ADD COLUMN pending_apk_original_name VARCHAR(255)",
-        "pending_apk_size": "ALTER TABLE store_app ADD COLUMN pending_apk_size INTEGER",
-        "pending_apk_sha256": "ALTER TABLE store_app ADD COLUMN pending_apk_sha256 VARCHAR(64)",
-        "pending_release_status": "ALTER TABLE store_app ADD COLUMN pending_release_status VARCHAR(20)",
-        "pending_release_note": "ALTER TABLE store_app ADD COLUMN pending_release_note TEXT",
-        "pending_release_submitted_at": f"ALTER TABLE store_app ADD COLUMN pending_release_submitted_at {datetime_type}",
-        "security_scan_status": "ALTER TABLE store_app ADD COLUMN security_scan_status VARCHAR(20) NOT NULL DEFAULT 'unscanned'",
-        "security_scan_summary": "ALTER TABLE store_app ADD COLUMN security_scan_summary TEXT",
-        "security_scanned_at": f"ALTER TABLE store_app ADD COLUMN security_scanned_at {datetime_type}",
-        "pending_security_scan_status": "ALTER TABLE store_app ADD COLUMN pending_security_scan_status VARCHAR(20)",
-        "pending_security_scan_summary": "ALTER TABLE store_app ADD COLUMN pending_security_scan_summary TEXT",
-        "pending_security_scanned_at": f"ALTER TABLE store_app ADD COLUMN pending_security_scanned_at {datetime_type}",
-        "malware_scan_status": "ALTER TABLE store_app ADD COLUMN malware_scan_status VARCHAR(20) NOT NULL DEFAULT 'unscanned'",
-        "malware_scan_summary": "ALTER TABLE store_app ADD COLUMN malware_scan_summary TEXT",
-        "malware_scanned_at": f"ALTER TABLE store_app ADD COLUMN malware_scanned_at {datetime_type}",
-        "pending_malware_scan_status": "ALTER TABLE store_app ADD COLUMN pending_malware_scan_status VARCHAR(20)",
-        "pending_malware_scan_summary": "ALTER TABLE store_app ADD COLUMN pending_malware_scan_summary TEXT",
-        "pending_malware_scanned_at": f"ALTER TABLE store_app ADD COLUMN pending_malware_scanned_at {datetime_type}",
-    }
-    for name, statement in additions.items():
-        if name not in columns:
-            db.session.execute(text(statement))
-
-    db.session.execute(
-        text(
-            "CREATE INDEX IF NOT EXISTS idx_store_app_pending_release "
-            "ON store_app (pending_release_status, pending_release_submitted_at) "
-            "WHERE pending_release_status IS NOT NULL"
-        )
-    )
-    if db.engine.dialect.name == "sqlite":
-        db.session.execute(text("PRAGMA optimize"))
 
 
 def create_app():
@@ -130,6 +55,8 @@ def create_app():
     app.config["APK_MAX_BYTES"] = 200 * 1024 * 1024
     app.config["CLAMAV_COMMAND"] = os.getenv("CLAMAV_COMMAND", "clamscan")
     app.config["CLAMAV_TIMEOUT_SECONDS"] = int(os.getenv("CLAMAV_TIMEOUT_SECONDS", "180"))
+    app.config["AUTO_MIGRATE"] = os.getenv("AUTO_MIGRATE", "false").lower() in {"1", "true", "yes"}
+    app.config["TRUST_PROXY"] = os.getenv("TRUST_PROXY", "false").lower() in {"1", "true", "yes"}
     if app.config["APP_ENV"] == "production":
         configuration_errors = []
         configured_secret = os.getenv("SECRET_KEY", "")
@@ -141,12 +68,33 @@ def create_app():
             configuration_errors.append("SESSION_COOKIE_SECURE must be true")
         if not app.config["PUBLIC_BASE_URL"].startswith("https://"):
             configuration_errors.append("PUBLIC_BASE_URL must use HTTPS")
+        if not app.config["SQLALCHEMY_DATABASE_URI"].startswith(
+            ("postgresql://", "postgresql+psycopg://")
+        ):
+            configuration_errors.append("DATABASE_URL must use PostgreSQL in production")
+        if not app.config["TRUST_PROXY"]:
+            configuration_errors.append("TRUST_PROXY must be true behind the production HTTPS proxy")
+        if app.config["AUTO_MIGRATE"]:
+            configuration_errors.append("AUTO_MIGRATE must be false in production")
+        if not os.getenv("PRIVATE_UPLOAD_ROOT"):
+            configuration_errors.append("PRIVATE_UPLOAD_ROOT must point to durable mounted storage")
+        elif not Path(app.config["PRIVATE_UPLOAD_ROOT"]).is_absolute():
+            configuration_errors.append("PRIVATE_UPLOAD_ROOT must be an absolute production path")
+        if not app.config["SMTP_HOST"]:
+            configuration_errors.append("SMTP_HOST is required for password-reset email")
+        if not app.config["SMTP_FROM_EMAIL"] or app.config["SMTP_FROM_EMAIL"].endswith(".local"):
+            configuration_errors.append("SMTP_FROM_EMAIL must be a real sender address")
+        if bool(app.config["SMTP_USERNAME"]) != bool(app.config["SMTP_PASSWORD"]):
+            configuration_errors.append("SMTP_USERNAME and SMTP_PASSWORD must be configured together")
+        clamav_command = app.config["CLAMAV_COMMAND"]
+        if not (shutil.which(clamav_command) or Path(clamav_command).is_file()):
+            configuration_errors.append("CLAMAV_COMMAND must resolve to an installed ClamAV scanner")
         admin_password = app.config["ADMIN_PASSWORD"] or ""
         if len(admin_password) < 12 or admin_password.startswith("replace-"):
             configuration_errors.append("ADMIN_PASSWORD must contain at least 12 characters")
         if configuration_errors:
             raise RuntimeError("Unsafe production configuration: " + "; ".join(configuration_errors))
-    if os.getenv("TRUST_PROXY", "false").lower() in {"1", "true", "yes"}:
+    if app.config["TRUST_PROXY"]:
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
     for folder in ("developer_ids", "app_icons", "app_screenshots", "apks"):
         (Path(app.config["PRIVATE_UPLOAD_ROOT"]) / folder).mkdir(
@@ -154,6 +102,7 @@ def create_app():
             exist_ok=True,
         )
     db.init_app(app)
+    migrate.init_app(app, db)
 
     @app.after_request
     def apply_security_headers(response):
@@ -194,13 +143,17 @@ def create_app():
     def readiness_check():
         """Verify required dependencies before accepting marketplace traffic."""
         checks = {"database": False, "schema": False, "private_storage": False}
+        if app.config["APP_ENV"] == "production":
+            checks.update({"smtp_config": False, "clamav": False})
         try:
             db.session.execute(text("SELECT 1"))
             checks["database"] = True
-            from application.models import SchemaVersion
-
-            schema_version = db.session.get(SchemaVersion, 1)
-            checks["schema"] = bool(schema_version and schema_version.version >= 5)
+            with db.engine.connect() as connection:
+                migration_context = MigrationContext.configure(connection)
+                current_revision = migration_context.get_current_revision()
+            migration_config = app.extensions["migrate"].migrate.get_config()
+            head_revision = ScriptDirectory.from_config(migration_config).get_current_head()
+            checks["schema"] = bool(current_revision and current_revision == head_revision)
         except Exception:
             db.session.rollback()
             app.logger.exception("Readiness database check failed.")
@@ -210,6 +163,15 @@ def create_app():
             checks["private_storage"] = upload_root.is_dir() and os.access(upload_root, os.R_OK | os.W_OK)
         except OSError:
             app.logger.exception("Readiness private storage check failed.")
+
+        if app.config["APP_ENV"] == "production":
+            checks["smtp_config"] = bool(
+                app.config["SMTP_HOST"] and app.config["SMTP_FROM_EMAIL"]
+            )
+            clamav_command = app.config["CLAMAV_COMMAND"]
+            checks["clamav"] = bool(
+                shutil.which(clamav_command) or Path(clamav_command).is_file()
+            )
 
         ready = all(checks.values())
         response = jsonify({"status": "ready" if ready else "not_ready", "checks": checks})
@@ -248,25 +210,32 @@ def create_app():
         app.logger.error("Unhandled application error", exc_info=error.original_exception or error)
         return render_safe_error(500, "Something went wrong", "The request could not be completed. Your saved data was not partially changed.", "bi-tools")
 
+    from application.controllers import main
+
+    app.register_blueprint(main)
+
+    @app.cli.command("production-check")
+    def production_check():
+        """Fail unless the deployed application and its services are ready."""
+        if app.config["APP_ENV"] != "production":
+            raise click.ClickException("APP_ENV must be production for this check")
+        response = app.test_client().get("/ready")
+        result = response.get_json()
+        for name, passed in result.get("checks", {}).items():
+            click.echo(f"{'PASS' if passed else 'FAIL'}  {name}")
+        if response.status_code != 200:
+            raise click.ClickException("Production services are not ready")
+        click.echo("Production preflight passed.")
+
     with app.app_context():
-        from application.models import AccountStatus, SchemaVersion, User, UserRole
+        from application.models import AccountStatus, User, UserRole
         from application.username_linked_list import username_index
 
-        db.create_all()
-        try:
-            upgrade_existing_user_table()
-            upgrade_existing_store_app_table()
-            schema_version = db.session.get(SchemaVersion, 1)
-            if schema_version is None:
-                schema_version = SchemaVersion(id=1, version=5)
-                db.session.add(schema_version)
-            else:
-                schema_version.version = 5
-            db.session.commit()
-        except Exception:
-            db.session.rollback()
-            app.logger.exception("Database schema upgrade failed; startup was stopped safely.")
-            raise
+        if app.config["AUTO_MIGRATE"]:
+            upgrade()
+        database_tables = set(inspect(db.engine).get_table_names())
+        if "user" not in database_tables:
+            return app
         admin_password = app.config["ADMIN_PASSWORD"]
         admin = User.query.filter_by(username=app.config["ADMIN_USERNAME"]).first()
         if admin is None and admin_password:
@@ -291,9 +260,6 @@ def create_app():
 
         username_index.rebuild(User.query.order_by(User.id).all())
 
-    from application.controllers import main
-
-    app.register_blueprint(main)
     return app
 
 

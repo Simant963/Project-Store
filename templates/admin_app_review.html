@@ -136,7 +136,7 @@
                         return this app</h2><p>Approved apps appear in the
                         marketplace and their APK becomes publicly downloadable
                         immediately.</p></div><div class="decision-actions">{%
-                    if app_record.status.value != 'approved' %}<form
+                    if app_record.status.value not in ['approved', 'deleted'] %}<form
                         method="post"
                         action="{{ url_for('main.manage_app', app_id=app_record.id, action='approve') }}"><input
                             type="hidden" name="csrf_token"
@@ -144,7 +144,7 @@
                             class="btn btn-success btn-lg rounded-pill"
                             type="submit"><i
                                 class="bi bi-cloud-check me-2"></i>Approve and
-                            publish</button></form>{% endif %}{% if app_record.status.value != 'approved' %}<form
+                            publish</button></form>{% endif %}{% if app_record.status.value not in ['approved', 'deleted'] %}<form
                         class="reject-form" method="post"
                         action="{{ url_for('main.manage_app', app_id=app_record.id, action='reject') }}"><input
                             type="hidden" name="csrf_token"
@@ -153,7 +153,7 @@
                             placeholder="Reason shown to developer"></textarea><button
                             class="btn btn-outline-danger rounded-pill"
                             type="submit">Reject app</button></form>{% endif %}{% if
-                    app_record.status.value == 'approved' %}<form method="post"
+                    admin.role.value == 'admin' and app_record.status.value == 'approved' %}<form method="post"
                         action="{{ url_for('main.manage_app', app_id=app_record.id, action='block') }}"><input
                             type="hidden" name="csrf_token"
                             value="{{ csrf_token }}"><input type="hidden"
@@ -161,15 +161,14 @@
                             value="Removed by administrator"><button
                             class="btn btn-outline-dark rounded-pill"
                             type="submit">Block from store</button></form>{%
-                    endif %}<form method="post"
+                    endif %}{% if admin.role.value == 'admin' and app_record.status.value != 'deleted' %}<form method="post"
                         action="{{ url_for('main.manage_app', app_id=app_record.id, action='delete') }}"
-                        onsubmit="return confirm('Permanently delete this app and its APK?')"><input
+                        onsubmit="return confirm('Move this app to trash? Its APK, listing, reviews, and history will be preserved.')"><input
                             type="hidden" name="csrf_token"
                             value="{{ csrf_token }}"><button
                             class="btn btn-outline-danger rounded-pill"
                             type="submit"><i
-                                class="bi bi-trash3 me-2"></i>Delete
-                            permanently</button></form></div></section>
+                                class="bi bi-trash3 me-2"></i>Move to trash</button></form>{% elif admin.role.value == 'admin' %}<form method="post" action="{{ url_for('main.manage_app', app_id=app_record.id, action='restore') }}" onsubmit="return confirm('Restore this app to its previous status?')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-outline-success rounded-pill" type="submit"><i class="bi bi-arrow-counterclockwise me-2"></i>Restore app</button></form><form method="post" action="{{ url_for('main.manage_app', app_id=app_record.id, action='hard_delete') }}" onsubmit="return confirm('WARNING: Permanently delete this app, every APK, screenshot, review, and report? This cannot be undone.')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger rounded-pill" type="submit"><i class="bi bi-exclamation-triangle me-2"></i>Delete permanently</button></form>{% endif %}</div></section>
         </main><div class="sidebar-backdrop"
             id="sidebarBackdrop"></div><script>const sidebar=document.getElementById('adminSidebar'),backdrop=document.getElementById('sidebarBackdrop');document.getElementById('sidebarToggle').addEventListener('click',()=>{sidebar.classList.toggle('open');backdrop.classList.toggle('show')});backdrop.addEventListener('click',()=>{sidebar.classList.remove('open');backdrop.classList.remove('show')});</script>
     </body></html>

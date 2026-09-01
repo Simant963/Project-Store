@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+!.env.example
+!.env.production.example
+env
+.venv
+instance
+__pycache__
+*.pyc
+*.db
+*.log
+.ruff_cache
+backups

@@ -215,16 +215,14 @@ def role_required(required_role):
         @wraps(view)
         def wrapped(*args, **kwargs):
             user = current_user()
-            if (
-                user is None
-                or user.role != required_role
-                or user.status != AccountStatus.APPROVED
-            ):
+            if user is None or user.status != AccountStatus.APPROVED:
                 session.clear()
                 flash("Please sign in with an approved account to continue.", "error")
                 if required_role == UserRole.ADMIN:
                     return redirect(url_for("main.admin_login"))
                 return redirect(url_for("main.account_login", role_name=required_role.value))
+            if user.role != required_role:
+                abort(403)
             return view(user, *args, **kwargs)
 
         return wrapped
@@ -252,7 +250,7 @@ def developer_access_required(view):
         if (
             user is None
             or user.role != UserRole.DEVELOPER
-            or user.status == AccountStatus.BLOCKED
+            or user.status in {AccountStatus.BLOCKED, AccountStatus.DELETED}
         ):
             session.clear()
             flash("Please sign in with your developer account to continue.", "error")
@@ -260,6 +258,28 @@ def developer_access_required(view):
         return view(user, *args, **kwargs)
 
     return wrapped
+
+
+def require_permanent_delete_confirmation(admin, target_type, target_label, cancel_url):
+    """Return a confirmation response until the admin re-authenticates correctly."""
+    confirmed = request.form.get("permanent_confirm") == "yes"
+    typed_label = request.form.get("confirm_label", "").strip()
+    password = request.form.get("admin_password", "")
+    if confirmed and secrets.compare_digest(typed_label, target_label) and admin.check_password(password):
+        return None
+
+    error = None
+    if confirmed:
+        error = "The password or confirmation name was incorrect. Nothing was deleted."
+    return render_template(
+        "hard_delete_confirm.html",
+        admin=admin,
+        target_type=target_type,
+        target_label=target_label,
+        cancel_url=cancel_url,
+        csrf_token=get_csrf_token(),
+        error=error,
+    ), 400 if error else 200
 
 
 def private_upload_folder(folder):
@@ -715,7 +735,7 @@ def admin_login():
             clear_login_failures("admin-login", identifier)
             sign_in_user(admin, request.form.get("remember") == "on")
             flash("Welcome back. You are signed in.", "success")
-            return redirect(url_for("main.admin_dashboard"))
+            return redirect(dashboard_url_for(admin))
 
         record_login_failure("admin-login", identifier)
         flash("Incorrect administrator username or password.", "error")
@@ -1647,7 +1667,8 @@ def admin_dashboard(admin):
     status_filter = request.args.get("status", "all")
 
     accounts_query = User.query.options(selectinload(User.developer_profile)).filter(
-        User.role.notin_([UserRole.ADMIN, UserRole.CO_ADMIN])
+        User.role.notin_([UserRole.ADMIN, UserRole.CO_ADMIN]),
+        User.status != AccountStatus.DELETED,
     )
     if admin.role == UserRole.CO_ADMIN:
         accounts_query = accounts_query.filter(User.role == UserRole.DEVELOPER)
@@ -1670,7 +1691,10 @@ def admin_dashboard(admin):
     )
     accounts = pagination.items
     counts = {
-        "total": User.query.filter(User.role.notin_([UserRole.ADMIN, UserRole.CO_ADMIN])).count(),
+        "total": User.query.filter(
+            User.role.notin_([UserRole.ADMIN, UserRole.CO_ADMIN]),
+            User.status != AccountStatus.DELETED,
+        ).count(),
         "pending": User.query.filter(User.status == AccountStatus.PENDING).count(),
         "developers": User.query.filter(User.role == UserRole.DEVELOPER).count(),
         "blocked": User.query.filter(User.status == AccountStatus.BLOCKED).count(),
@@ -1683,7 +1707,7 @@ def admin_dashboard(admin):
         role_filter=role_filter,
         status_filter=status_filter,
         query_text=query_text,
-        statuses=AccountStatus,
+        statuses=[status for status in AccountStatus if status != AccountStatus.DELETED],
         pagination=pagination,
         pagination_params={key: value for key, value in request.args.items() if key != "page"},
         csrf_token=get_csrf_token(),
@@ -1762,6 +1786,16 @@ def admin_audit_log(admin):
     pagination = logs_query.order_by(AuditLog.created_at.desc(), AuditLog.id.desc()).paginate(
         page=page, per_page=30, error_out=False
     )
+    return render_template(
+        "admin_audit_log.html",
+        admin=admin,
+        logs=pagination.items,
+        pagination=pagination,
+        pagination_params={"action": action_value},
+        actions=AuditAction,
+        action_value=action_value,
+        csrf_token=get_csrf_token(),
+    )
 
 
 @main.route("/admin/co-admins", methods=["GET", "POST"])
@@ -1802,6 +1836,25 @@ def admin_co_admins(admin):
     return render_template("admin_co_admins.html", admin=admin, co_admins=co_admins, csrf_token=get_csrf_token())
 
 
+@main.get("/admin/trash")
+@role_required(UserRole.ADMIN)
+def admin_trash(admin):
+    deleted_accounts = User.query.options(selectinload(User.developer_profile)).filter(
+        User.role.notin_([UserRole.ADMIN, UserRole.CO_ADMIN]),
+        User.status == AccountStatus.DELETED,
+    ).order_by(User.deleted_at.desc(), User.id.desc()).all()
+    deleted_apps = StoreApp.query.options(joinedload(StoreApp.developer)).filter(
+        StoreApp.status == AppStatus.DELETED,
+    ).order_by(StoreApp.deleted_at.desc(), StoreApp.id.desc()).all()
+    return render_template(
+        "admin_trash.html",
+        admin=admin,
+        accounts=deleted_accounts,
+        apps=deleted_apps,
+        csrf_token=get_csrf_token(),
+    )
+
+
 @main.post("/admin/co-admins/<int:user_id>/toggle")
 @role_required(UserRole.ADMIN)
 def toggle_co_admin(admin, user_id):
@@ -1820,11 +1873,6 @@ def toggle_co_admin(admin, user_id):
     db.session.commit()
     flash(f"Co-admin {co_admin.username} was {operation}d.", "success")
     return redirect(url_for("main.admin_co_admins"))
-    return render_template(
-        "admin_audit_log.html", admin=admin, logs=pagination.items,
-        pagination=pagination, pagination_params={"action": action_value},
-        actions=AuditAction, action_value=action_value, csrf_token=get_csrf_token(),
-    )
 
 
 @main.post("/admin/reports/<int:report_id>/<action>")
@@ -1870,7 +1918,9 @@ def admin_apps(admin):
     page = request.args.get("page", 1, type=int)
     status_value = request.args.get("status", "all")
     query_text = request.args.get("q", "").strip()
-    apps_query = StoreApp.query.options(joinedload(StoreApp.developer))
+    apps_query = StoreApp.query.options(joinedload(StoreApp.developer)).filter(
+        StoreApp.status != AppStatus.DELETED
+    )
     if status_value == AppStatus.PENDING.value:
         apps_query = apps_query.filter(
             or_(
@@ -1894,7 +1944,7 @@ def admin_apps(admin):
     )
     apps = pagination.items
     counts = {
-        "total": StoreApp.query.count(),
+        "total": StoreApp.query.filter(StoreApp.status != AppStatus.DELETED).count(),
         "pending": StoreApp.query.filter(
             or_(
                 StoreApp.status == AppStatus.PENDING,
@@ -1909,7 +1959,7 @@ def admin_apps(admin):
         admin=admin,
         apps=apps,
         counts=counts,
-        statuses=AppStatus,
+        statuses=[status for status in AppStatus if status != AppStatus.DELETED],
         pagination=pagination,
         pagination_params={key: value for key, value in request.args.items() if key != "page"},
         status_value=status_value,
@@ -2061,10 +2111,20 @@ def manage_app(admin, app_id, action):
     app_record = db.session.get(StoreApp, app_id)
     if app_record is None:
         abort(404)
-    if action not in {"approve", "reject", "block", "delete"}:
+    if action not in {"approve", "reject", "block", "delete", "restore", "hard_delete"}:
         abort(404)
     if admin.role == UserRole.CO_ADMIN and action not in {"approve", "reject"}:
         abort(403)
+    if app_record.status == AppStatus.DELETED and action not in {"restore", "hard_delete"}:
+        abort(409)
+    if action == "hard_delete":
+        if app_record.status != AppStatus.DELETED:
+            abort(409)
+        confirmation = require_permanent_delete_confirmation(
+            admin, "app", app_record.name, url_for("main.admin_trash")
+        )
+        if confirmation:
+            return confirmation
     if action == "approve" and app_record.developer.status != AccountStatus.APPROVED:
         flash("Approve the developer account before approving this app.", "error")
         return redirect(url_for("main.admin_app_review", app_id=app_id))
@@ -2077,7 +2137,8 @@ def manage_app(admin, app_id, action):
 
     action_labels = {
         "approve": "approved", "reject": "rejected",
-        "block": "blocked", "delete": "deleted",
+        "block": "blocked", "delete": "moved to trash",
+        "restore": "restored", "hard_delete": "permanently deleted",
     }
 
     review_note = request.form.get("review_note", "").strip()
@@ -2091,6 +2152,10 @@ def manage_app(admin, app_id, action):
     elif action == "block":
         app_record.block(review_note)
     elif action == "delete":
+        app_record.soft_delete(review_note)
+    elif action == "restore":
+        app_record.restore()
+    elif action == "hard_delete":
         cleanup_files.extend(
             [
                 ("apks", app_record.apk_file),
@@ -2114,10 +2179,10 @@ def manage_app(admin, app_id, action):
     )
     record_admin_audit(admin, AuditAction.APP_MODERATION, action, "app", app_id, app_name, review_note)
     db.session.commit()
-    if action == "delete":
+    if action == "hard_delete":
         for folder, filename in cleanup_files:
             safe_delete_upload(folder, filename)
-        status_value = "deleted"
+        status_value = "hard_deleted"
     else:
         status_value = app_record.status.value
     event = account_events.publish(
@@ -2134,6 +2199,8 @@ def manage_app(admin, app_id, action):
     if request.headers.get("X-Requested-With") == "fetch":
         return jsonify({"ok": True, "message": message, "event": event})
     flash(message, "success")
+    if request.referrer and urlparse(request.referrer).path == url_for("main.admin_trash"):
+        return redirect(url_for("main.admin_trash"))
     return redirect(url_for("main.admin_apps"))
 
 
@@ -2192,7 +2259,7 @@ def developer_app_events(user):
 @main.get("/events/my-account")
 def my_account_events():
     user = current_user()
-    if user is None or user.status == AccountStatus.BLOCKED:
+    if user is None or user.status in {AccountStatus.BLOCKED, AccountStatus.DELETED}:
         return Response(status=401)
     user_id = user.id
     return server_event_response(lambda event: event.get("user_id") == user_id)
@@ -2208,7 +2275,7 @@ def account_access_changed():
     messages = {
         "blocked": "Your account was blocked by an administrator.",
         "rejected": "Your account access was rejected by an administrator.",
-        "deleted": "Your account was deleted by an administrator.",
+        "deleted": "Your account was moved to trash by an administrator and can be restored.",
     }
     flash(messages.get(state, "Your account access changed. Please sign in again."), "error")
     return redirect(url_for("main.account_login", role_name=role_value))
@@ -2233,7 +2300,9 @@ def manage_account(admin, user_id, action):
         "reject": "rejected",
         "block": "blocked",
         "unblock": "unblocked",
-        "delete": "deleted",
+        "delete": "moved to trash",
+        "restore": "restored",
+        "hard_delete": "permanently deleted",
     }
     if action not in labels:
         abort(404)
@@ -2241,6 +2310,16 @@ def manage_account(admin, user_id, action):
         account.role != UserRole.DEVELOPER or action not in {"approve", "reject"}
     ):
         abort(403)
+    if account.status == AccountStatus.DELETED and action not in {"restore", "hard_delete"}:
+        abort(409)
+    if action == "hard_delete":
+        if account.status != AccountStatus.DELETED:
+            abort(409)
+        confirmation = require_permanent_delete_confirmation(
+            admin, "account", account.username, url_for("main.admin_trash")
+        )
+        if confirmation:
+            return confirmation
 
     if (
         action == "approve"
@@ -2285,6 +2364,10 @@ def manage_account(admin, user_id, action):
         else:
             account.unblock()
     elif action == "delete":
+        account.soft_delete()
+    elif action == "restore":
+        account.restore()
+    elif action == "hard_delete":
         if account.developer_profile and account.developer_profile.government_id_file:
             cleanup_files.append(
                 ("developer_ids", account.developer_profile.government_id_file)
@@ -2306,7 +2389,7 @@ def manage_account(admin, user_id, action):
             )
         db.session.delete(account)
 
-    if action != "delete":
+    if action != "hard_delete":
         create_notification(
             user_id, NotificationType.ACCOUNT, f"Account {labels[action]}",
             review_note or f"Your {role_value} account was {labels[action]} by an administrator.",
@@ -2314,11 +2397,11 @@ def manage_account(admin, user_id, action):
         )
     record_admin_audit(admin, AuditAction.ACCOUNT_MODERATION, action, "account", user_id, username, review_note)
     db.session.commit()
-    if action == "delete":
+    if action == "hard_delete":
         username_index.remove(username)
         for folder, filename in cleanup_files:
             safe_delete_upload(folder, filename)
-        status_value = "deleted"
+        status_value = "hard_deleted"
     else:
         status_value = account.status.value
 
@@ -2337,6 +2420,8 @@ def manage_account(admin, user_id, action):
         return jsonify({"ok": True, "message": message, "event": event})
 
     flash(message, "success")
+    if request.referrer and urlparse(request.referrer).path == url_for("main.admin_trash"):
+        return redirect(url_for("main.admin_trash"))
     return redirect(url_for("main.admin_dashboard"))
 
 
@@ -2515,6 +2600,16 @@ def developer_dashboard(user):
 
 @main.post("/logout")
 def logout():
-    if valid_csrf_token():
-        session.clear()
+    if not valid_csrf_token():
+        abort(400)
+    user = current_user()
+    if request.form.get("confirm") != "yes":
+        return render_template(
+            "logout_confirm.html",
+            user=user,
+            cancel_url=dashboard_url_for(user) if user else url_for("main.home"),
+            csrf_token=get_csrf_token(),
+        )
+    session.clear()
+    flash("You have been signed out safely.", "success")
     return redirect(url_for("main.home"))

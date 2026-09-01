@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 import io
 import base64
 import os
@@ -15,6 +16,7 @@ os.environ["SECRET_KEY"] = "apk-security-test"
 os.environ["ADMIN_USERNAME"] = "security_admin"
 os.environ["ADMIN_EMAIL"] = "security-admin@example.com"
 os.environ["ADMIN_PASSWORD"] = "AdminPass123!"
+os.environ["AUTO_MIGRATE"] = "true"
 
 from app import app
 from application.database import db
@@ -117,6 +119,21 @@ try:
     token = csrf(developer_client, "/developer/apps/new")
     unsafe = developer_client.post("/developer/apps/new", data=app_form(token, "Unsafe Paths", "com.example.unsafepaths", UNSAFE_PATH_APK), content_type="multipart/form-data", follow_redirects=True)
     assert b"unsafe file path" in unsafe.data
+
+    controllers.scan_apk_for_malware = lambda path: (_ for _ in ()).throw(
+        ValueError("Malware detected by test scanner")
+    )
+    token = csrf(developer_client, "/developer/apps/new")
+    infected = developer_client.post(
+        "/developer/apps/new",
+        data=app_form(token, "Infected Build", "com.example.infected", VALID_APK),
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert infected.status_code == 200 and b"Malware detected" in infected.data
+    with app.app_context():
+        assert StoreApp.query.filter_by(package_name="com.example.infected").first() is None
+    controllers.scan_apk_for_malware = lambda path: "ClamAV malware scan passed · no threats detected"
 
     token = csrf(developer_client, "/developer/apps/new")
     duplicate = developer_client.post("/developer/apps/new", data=app_form(token, "Duplicate Build", "com.example.duplicatebuild", VALID_APK), content_type="multipart/form-data", follow_redirects=True)

@@ -18,6 +18,7 @@ class AccountStatus(str, Enum):
     APPROVED = "approved"
     REJECTED = "rejected"
     BLOCKED = "blocked"
+    DELETED = "deleted"
 
 
 class GovernmentIdType(str, Enum):
@@ -46,6 +47,7 @@ class AppStatus(str, Enum):
     APPROVED = "approved"
     REJECTED = "rejected"
     BLOCKED = "blocked"
+    DELETED = "deleted"
 
 
 class ReleaseStatus(str, Enum):
@@ -114,18 +116,6 @@ def format_file_size(byte_count):
         size /= 1024
 
 
-class SchemaVersion(db.Model):
-    __tablename__ = "schema_version"
-
-    id = db.Column(db.Integer, primary_key=True, default=1)
-    version = db.Column(db.Integer, nullable=False)
-    updated_at = db.Column(
-        db.DateTime(timezone=True), nullable=False,
-        default=lambda: datetime.now(timezone.utc),
-        onupdate=lambda: datetime.now(timezone.utc),
-    )
-
-
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False, index=True)
@@ -163,6 +153,8 @@ class User(db.Model):
     )
     approved_at = db.Column(db.DateTime(timezone=True), nullable=True)
     last_login_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    deleted_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    status_before_delete = db.Column(db.String(20), nullable=True)
     developer_profile = db.relationship(
         "DeveloperProfile",
         back_populates="user",
@@ -214,6 +206,19 @@ class User(db.Model):
         self.status = AccountStatus.APPROVED
         if self.approved_at is None:
             self.approved_at = datetime.now(timezone.utc)
+
+    def soft_delete(self):
+        if self.status != AccountStatus.DELETED:
+            self.status_before_delete = self.status.value
+        self.status = AccountStatus.DELETED
+        self.deleted_at = datetime.now(timezone.utc)
+
+    def restore(self):
+        allowed = {status.value: status for status in AccountStatus if status != AccountStatus.DELETED}
+        fallback = AccountStatus.PENDING if self.role == UserRole.DEVELOPER else AccountStatus.APPROVED
+        self.status = allowed.get(self.status_before_delete, fallback)
+        self.status_before_delete = None
+        self.deleted_at = None
 
 
 class DeveloperProfile(db.Model):
@@ -385,6 +390,8 @@ class StoreApp(db.Model):
         default=lambda: datetime.now(timezone.utc),
     )
     approved_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    deleted_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    status_before_delete = db.Column(db.String(20), nullable=True)
     updated_at = db.Column(
         db.DateTime(timezone=True),
         nullable=False,
@@ -458,6 +465,19 @@ class StoreApp(db.Model):
     def block(self, note=None):
         self.status = AppStatus.BLOCKED
         self.review_note = note or self.review_note
+
+    def soft_delete(self, note=None):
+        if self.status != AppStatus.DELETED:
+            self.status_before_delete = self.status.value
+        self.status = AppStatus.DELETED
+        self.deleted_at = datetime.now(timezone.utc)
+        self.review_note = note or self.review_note
+
+    def restore(self):
+        allowed = {status.value: status for status in AppStatus if status != AppStatus.DELETED}
+        self.status = allowed.get(self.status_before_delete, AppStatus.PENDING)
+        self.status_before_delete = None
+        self.deleted_at = None
 
     def clear_pending_release(self):
         self.pending_version = None

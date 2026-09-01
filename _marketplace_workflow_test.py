@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 import os
 import re
 import shutil
@@ -12,6 +13,7 @@ os.environ["SECRET_KEY"] = "workflow-test"
 os.environ["ADMIN_USERNAME"] = "workflow_admin"
 os.environ["ADMIN_EMAIL"] = "admin@example.com"
 os.environ["ADMIN_PASSWORD"] = "AdminPass123!"
+os.environ["AUTO_MIGRATE"] = "true"
 
 from app import app
 from application.database import db
@@ -78,6 +80,7 @@ try:
             privacy_policy_url="https://example.com/privacy", icon_file="icon.png",
             apk_file="app.apk", apk_original_name="workflow.apk", apk_size=3,
             apk_sha256="a" * 64, security_scan_status=SecurityScanStatus.PASSED,
+            malware_scan_status=SecurityScanStatus.PASSED,
             status=AppStatus.APPROVED, approved_at=datetime.now(timezone.utc),
         )
         db.session.add(store_app)
@@ -156,6 +159,8 @@ try:
     with co_admin.session_transaction() as session:
         co_token = session["_csrf_token"]
     assert co_admin.get("/admin/apps").status_code == 200
+    assert co_admin.get("/admin/moderation").status_code == 403
+    assert co_admin.get("/admin/audit-log").status_code == 403
     approved_developer = co_admin.post(
         f"/admin/accounts/{pending_developer_id}/approve",
         data={"csrf_token": co_token}, headers={"X-Requested-With": "fetch"},
@@ -165,12 +170,87 @@ try:
         f"/admin/accounts/{pending_developer_id}/block", data={"csrf_token": co_token}
     )
     assert forbidden_block.status_code == 403
-    assert co_admin.get("/admin/co-admins").status_code == 302
+    rejected_app = co_admin.post(
+        f"/admin/apps/{app_id}/reject",
+        data={"csrf_token": co_token, "review_note": "Needs another review"},
+    )
+    assert rejected_app.status_code == 302
+    approved_app = co_admin.post(
+        f"/admin/apps/{app_id}/approve", data={"csrf_token": co_token}
+    )
+    assert approved_app.status_code == 302
+    assert co_admin.post(
+        f"/admin/apps/{app_id}/delete", data={"csrf_token": co_token}
+    ).status_code == 403
+    assert co_admin.get("/admin/co-admins").status_code == 403
+    assert co_admin.get("/admin/trash").status_code == 403
     with app.app_context():
         assert AppReport.query.one().status == ReportStatus.RESOLVED
         assert all(token.used_at is not None for token in PasswordResetToken.query.all())
-        assert AuditLog.query.count() == 8
+        assert AuditLog.query.count() >= 10
     assert admin.get("/admin/audit-log").status_code == 200
+    assert admin.get("/admin/trash").status_code == 200
+    soft_deleted_app = admin.post(
+        f"/admin/apps/{app_id}/delete", data={"csrf_token": token}
+    )
+    assert soft_deleted_app.status_code == 302
+    with app.app_context():
+        deleted_app = db.session.get(StoreApp, app_id)
+        assert deleted_app.status == AppStatus.DELETED
+        assert (uploads / "apks" / deleted_app.apk_file).exists()
+    assert admin.get("/admin/trash").status_code == 200
+    restored_app = admin.post(
+        f"/admin/apps/{app_id}/restore", data={"csrf_token": token}
+    )
+    assert restored_app.status_code == 302
+    with app.app_context():
+        assert db.session.get(StoreApp, app_id).status == AppStatus.APPROVED
+    with app.app_context():
+        disposable = User(
+            username="delete_safety_test", email="delete-safety@example.com",
+            role=UserRole.USER, status=AccountStatus.APPROVED,
+        )
+        disposable.set_password("DisposablePass123!")
+        disposable.approve()
+        db.session.add(disposable)
+        db.session.commit()
+        disposable_id = disposable.id
+    soft_deleted = admin.post(
+        f"/admin/accounts/{disposable_id}/delete", data={"csrf_token": token}
+    )
+    assert soft_deleted.status_code == 302
+    with app.app_context():
+        assert db.session.get(User, disposable_id).status == AccountStatus.DELETED
+    confirmation = admin.post(
+        f"/admin/accounts/{disposable_id}/hard_delete", data={"csrf_token": token}
+    )
+    assert confirmation.status_code == 200 and b"Irreversible action" in confirmation.data
+    refused = admin.post(
+        f"/admin/accounts/{disposable_id}/hard_delete",
+        data={
+            "csrf_token": token, "permanent_confirm": "yes",
+            "confirm_label": "delete_safety_test", "admin_password": "wrong",
+        },
+    )
+    assert refused.status_code == 400
+    permanently_deleted = admin.post(
+        f"/admin/accounts/{disposable_id}/hard_delete",
+        data={
+            "csrf_token": token, "permanent_confirm": "yes",
+            "confirm_label": "delete_safety_test", "admin_password": "AdminPass123!",
+        },
+    )
+    assert permanently_deleted.status_code == 302
+    with app.app_context():
+        assert db.session.get(User, disposable_id) is None
+    logout_warning = co_admin.post("/logout", data={"csrf_token": co_token})
+    assert logout_warning.status_code == 200 and b"Sign out of Appora" in logout_warning.data
+    assert co_admin.get("/admin/apps").status_code == 200
+    signed_out = co_admin.post(
+        "/logout", data={"csrf_token": co_token, "confirm": "yes"}
+    )
+    assert signed_out.status_code == 302
+    assert co_admin.get("/admin/apps").status_code == 302
     print("marketplace-workflow-tests-passed")
 finally:
     shutil.rmtree(test_root, ignore_errors=True)
