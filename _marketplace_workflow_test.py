@@ -37,6 +37,29 @@ def csrf(client, url):
 
 try:
     uploads = test_root / "uploads"
+    for policy_path in (
+        "/policies", "/privacy", "/terms", "/developer-agreement",
+        "/acceptable-use", "/copyright", "/data-retention",
+    ):
+        assert app.test_client().get(policy_path).status_code == 200
+    registration_client = app.test_client()
+    registration_token = csrf(registration_client, "/register/user")
+    registration_data = {
+        "csrf_token": registration_token, "username": "policy_user",
+        "email": "policy-user@example.com", "password": "PolicyPass123!",
+        "confirm_password": "PolicyPass123!",
+    }
+    rejected_terms = registration_client.post(
+        "/register/user", data=registration_data, follow_redirects=True
+    )
+    assert b"must accept the Terms" in rejected_terms.data
+    registration_data["accept_terms"] = "yes"
+    accepted_terms = registration_client.post("/register/user", data=registration_data)
+    assert accepted_terms.status_code == 200 and b"Account created" in accepted_terms.data
+    with app.app_context():
+        policy_user = User.query.filter_by(username="policy_user").one()
+        assert policy_user.terms_accepted_at is not None
+        assert policy_user.terms_version == app.config["POLICY_VERSION"]
     assert app.test_client().get("/health").get_json() == {"status": "ok"}
     assert b"Reset user password" in app.test_client().get("/login/user").data
     assert b"Reset developer password" in app.test_client().get("/login/developer").data
@@ -127,6 +150,25 @@ try:
     assert admin.post("/admin/login", data={"csrf_token": token, "identifier": "workflow_admin", "password": "AdminPass123!"}).status_code == 302
     with admin.session_transaction() as session:
         admin_token = session["_csrf_token"]
+    assert admin.get("/admin/settings").status_code == 200
+    refused_settings = admin.post(
+        "/admin/settings",
+        data={
+            "csrf_token": admin_token, "email": "new-admin@example.com",
+            "current_password": "incorrect",
+        },
+        follow_redirects=True,
+    )
+    assert b"current administrator password" in refused_settings.data
+    updated_settings = admin.post(
+        "/admin/settings",
+        data={
+            "csrf_token": admin_token, "email": "new-admin@example.com",
+            "current_password": "AdminPass123!",
+        },
+        follow_redirects=True,
+    )
+    assert b"settings were updated securely" in updated_settings.data
     for action in ("approve", "block", "unblock", "reject"):
         response = admin.post(
             f"/admin/accounts/{pending_developer_id}/{action}",
@@ -159,6 +201,7 @@ try:
     with co_admin.session_transaction() as session:
         co_token = session["_csrf_token"]
     assert co_admin.get("/admin/apps").status_code == 200
+    assert co_admin.get("/admin/settings").status_code == 200
     assert co_admin.get("/admin/moderation").status_code == 403
     assert co_admin.get("/admin/audit-log").status_code == 403
     approved_developer = co_admin.post(

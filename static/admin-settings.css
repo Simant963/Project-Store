@@ -1,0 +1,15 @@
+.admin-settings-card {
+    width: min(100%, 760px);
+    margin-top: 24px;
+}
+
+.admin-settings-card button:disabled {
+    cursor: wait;
+    opacity: .7;
+}
+
+@media (max-width: 767px) {
+    .admin-settings-card {
+        padding: 20px;
+    }
+}

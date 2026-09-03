@@ -30,7 +30,7 @@
         <span class="sidebar-label">Marketplace</span>
         <nav class="sidebar-nav">
             <a href="{{ url_for('main.home') }}"><i class="bi bi-shop"></i>View storefront</a>
-            <a href="#"><i class="bi bi-gear"></i>Settings<small>Next</small></a>
+            <a href="{{ url_for('main.admin_settings') }}"><i class="bi bi-gear"></i>Settings</a>
         </nav>
         <div class="sidebar-admin">
             <span class="admin-avatar">{{ admin.initials }}</span>

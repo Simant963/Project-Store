@@ -198,9 +198,9 @@
                 <div class="col-lg-5"><a class="navbar-brand" href="#top"><span class="brand-mark"><i class="bi bi-boxes"></i></span>Appora</a><p class="footer-copy mt-3">A welcoming place to discover, download, and share great apps.</p></div>
                 <div class="col-6 col-lg"><h3>Discover</h3><a href="#apps">Featured apps</a><a href="#categories">Categories</a><a href="#safety">App safety</a></div>
                 <div class="col-6 col-lg"><h3>Developers</h3><a href="#developers">Upload an app</a><a href="#upload-steps">Publishing guide</a><a href="#developers">Developer tools</a></div>
-                <div class="col-6 col-lg"><h3>Company</h3><a href="#top">About Appora</a><a href="#top">Support</a><a href="#top">Contact</a></div>
+                <div class="col-6 col-lg"><h3>Company</h3><a href="{{ url_for('main.policy_center') }}">Policy center</a><a href="{{ url_for('main.privacy_policy') }}">Privacy</a><a href="{{ url_for('main.terms_of_service') }}">Terms</a><a href="mailto:{{ config.SUPPORT_EMAIL }}">Support</a></div>
             </div>
-            <div class="footer-bottom d-flex flex-column flex-md-row justify-content-between gap-2"><span>© 2026 Appora. All rights reserved.</span><span>Made for apps and the people behind them.</span></div>
+            <div class="footer-bottom d-flex flex-column flex-md-row justify-content-between gap-2"><span>© 2026 {{ config.LEGAL_OPERATOR_NAME }}. All rights reserved.</span><span><a href="{{ url_for('main.acceptable_use_policy') }}">Acceptable use</a> · <a href="{{ url_for('main.copyright_policy') }}">Copyright</a> · <a href="{{ url_for('main.data_retention_policy') }}">Data retention</a></span></div>
         </div>
     </footer>
 

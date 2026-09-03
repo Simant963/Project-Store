@@ -155,6 +155,8 @@ class User(db.Model):
     last_login_at = db.Column(db.DateTime(timezone=True), nullable=True)
     deleted_at = db.Column(db.DateTime(timezone=True), nullable=True)
     status_before_delete = db.Column(db.String(20), nullable=True)
+    terms_accepted_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    terms_version = db.Column(db.String(20), nullable=True)
     developer_profile = db.relationship(
         "DeveloperProfile",
         back_populates="user",

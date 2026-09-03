@@ -57,6 +57,13 @@ def create_app():
     app.config["CLAMAV_TIMEOUT_SECONDS"] = int(os.getenv("CLAMAV_TIMEOUT_SECONDS", "180"))
     app.config["AUTO_MIGRATE"] = os.getenv("AUTO_MIGRATE", "false").lower() in {"1", "true", "yes"}
     app.config["TRUST_PROXY"] = os.getenv("TRUST_PROXY", "false").lower() in {"1", "true", "yes"}
+    app.config["POLICY_VERSION"] = os.getenv("POLICY_VERSION", "2026-09-03")
+    app.config["LEGAL_OPERATOR_NAME"] = os.getenv("LEGAL_OPERATOR_NAME", "Appora")
+    app.config["LEGAL_ADDRESS"] = os.getenv("LEGAL_ADDRESS", "India")
+    app.config["SUPPORT_EMAIL"] = os.getenv("SUPPORT_EMAIL", "support@appora.local")
+    app.config["PRIVACY_EMAIL"] = os.getenv("PRIVACY_EMAIL", "privacy@appora.local")
+    app.config["GRIEVANCE_OFFICER_NAME"] = os.getenv("GRIEVANCE_OFFICER_NAME", "Appora Grievance Officer")
+    app.config["GRIEVANCE_EMAIL"] = os.getenv("GRIEVANCE_EMAIL", "grievance@appora.local")
     if app.config["APP_ENV"] == "production":
         configuration_errors = []
         configured_secret = os.getenv("SECRET_KEY", "")
@@ -84,6 +91,13 @@ def create_app():
             configuration_errors.append("SMTP_HOST is required for password-reset email")
         if not app.config["SMTP_FROM_EMAIL"] or app.config["SMTP_FROM_EMAIL"].endswith(".local"):
             configuration_errors.append("SMTP_FROM_EMAIL must be a real sender address")
+        for key in ("SUPPORT_EMAIL", "PRIVACY_EMAIL", "GRIEVANCE_EMAIL"):
+            if not app.config[key] or app.config[key].endswith(".local"):
+                configuration_errors.append(f"{key} must be a real monitored address")
+        if not os.getenv("LEGAL_OPERATOR_NAME") or not os.getenv("LEGAL_ADDRESS"):
+            configuration_errors.append("LEGAL_OPERATOR_NAME and LEGAL_ADDRESS are required")
+        if not os.getenv("GRIEVANCE_OFFICER_NAME"):
+            configuration_errors.append("GRIEVANCE_OFFICER_NAME is required")
         if bool(app.config["SMTP_USERNAME"]) != bool(app.config["SMTP_PASSWORD"]):
             configuration_errors.append("SMTP_USERNAME and SMTP_PASSWORD must be configured together")
         clamav_command = app.config["CLAMAV_COMMAND"]
@@ -235,6 +249,17 @@ def create_app():
             upgrade()
         database_tables = set(inspect(db.engine).get_table_names())
         if "user" not in database_tables:
+            return app
+        database_user_columns = {
+            column["name"] for column in inspect(db.engine).get_columns("user")
+        }
+        if not set(User.__table__.columns.keys()).issubset(database_user_columns):
+            return app
+        with db.engine.connect() as connection:
+            current_revision = MigrationContext.configure(connection).get_current_revision()
+        migration_config = app.extensions["migrate"].migrate.get_config()
+        head_revision = ScriptDirectory.from_config(migration_config).get_current_head()
+        if current_revision != head_revision:
             return app
         admin_password = app.config["ADMIN_PASSWORD"]
         admin = User.query.filter_by(username=app.config["ADMIN_USERNAME"]).first()

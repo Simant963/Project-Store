@@ -12,13 +12,19 @@
 1. Copy `.env.production.example` to `.env.production` and replace every placeholder.
 2. Set `PUBLIC_BASE_URL` and the administrator email to the real domain.
 3. Add the TLS certificate and private key under `deployment/certs`.
-4. Build and start the stack:
+4. Run the local release preflight. It validates settings without displaying secret values:
+
+   ```text
+   powershell -File deployment/preflight.ps1
+   ```
+
+5. Build and start the stack:
 
    ```text
    docker compose --env-file .env.production -f docker-compose.production.yml up -d --build
    ```
 
-5. Verify migrations, service health, and application readiness:
+6. Verify migrations, service health, and application readiness:
 
    ```text
    docker compose --env-file .env.production -f docker-compose.production.yml ps

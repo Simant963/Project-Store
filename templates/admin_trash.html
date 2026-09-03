@@ -9,7 +9,7 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body class="admin-page">
-    <aside class="admin-sidebar">
+    <aside class="admin-sidebar" id="adminSidebar">
         <a class="navbar-brand" href="{{ url_for('main.admin_dashboard') }}"><span class="brand-mark"><i class="bi bi-boxes"></i></span>Appora</a>
         <span class="sidebar-label">Administration</span>
         <nav class="sidebar-nav">
@@ -20,7 +20,7 @@
         <div class="sidebar-admin"><span class="admin-avatar">{{ admin.initials }}</span><div><strong>{{ admin.username }}</strong><small>Administrator</small></div><form method="post" action="{{ url_for('main.logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit" aria-label="Sign out"><i class="bi bi-box-arrow-right"></i></button></form></div>
     </aside>
     <main class="admin-main">
-        <header class="admin-topbar"><div><span class="eyebrow">Recoverable deletion</span><h1>Trash</h1><p>Restore records or permanently erase them when legally necessary.</p></div></header>
+        <header class="admin-topbar"><button class="sidebar-toggle" type="button" id="sidebarToggle" aria-label="Open navigation"><i class="bi bi-list"></i></button><div><span class="eyebrow">Recoverable deletion</span><h1>Trash</h1><p>Restore records or permanently erase them when legally necessary.</p></div></header>
         {% with messages=get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="dashboard-alert {{ category }}">{{ message }}</div>{% endfor %}{% endwith %}
         <section class="management-panel trash-panel">
             <div class="management-heading"><div><h2>Deleted accounts</h2><p>{{ accounts|length }} recoverable account{{ '' if accounts|length == 1 else 's' }}</p></div></div>
@@ -34,6 +34,6 @@
                 {% for app in apps %}<article><img class="table-app-icon" src="{{ url_for('main.app_icon', app_id=app.id) }}" alt=""><div><strong>{{ app.name }}</strong><small>{{ app.package_name }} · {{ app.developer.username }}</small></div><form method="post" action="{{ url_for('main.manage_app', app_id=app.id, action='restore') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-outline-success btn-sm" type="submit">Restore</button></form><form method="post" action="{{ url_for('main.manage_app', app_id=app.id, action='hard_delete') }}" onsubmit="return confirm('WARNING: Permanently delete this app and all associated files and history? This cannot be undone.')"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger btn-sm" type="submit">Delete permanently</button></form></article>{% else %}<div class="library-empty">No deleted apps.</div>{% endfor %}
             </div>
         </section>
-    </main>
+    </main><div class="sidebar-backdrop" id="sidebarBackdrop"></div><script src="{{ url_for('static', filename='app-ui.js') }}"></script>
 </body>
 </html>

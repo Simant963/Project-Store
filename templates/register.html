@@ -68,7 +68,7 @@
                         <div class="form-group"><label for="confirm_password">Confirm password</label><div class="field-wrap"><i class="bi bi-shield-check"></i><input id="confirm_password" name="confirm_password" type="password" placeholder="Repeat password" required autocomplete="new-password"><button class="password-toggle" type="button" data-toggle-password="confirm_password" aria-label="Show password"><i class="bi bi-eye"></i></button></div></div>
                     </div>
                     {% if is_developer %}<div class="approval-notice"><i class="bi bi-person-vcard"></i><div><strong>Identity verification required</strong><span>After sign-up, add your legal details and government ID for administrator approval.</span></div></div>{% endif %}
-                    <label class="terms-row"><input type="checkbox" required><span>I agree to the Appora terms and community guidelines.</span></label>
+                    <label class="terms-row"><input type="checkbox" name="accept_terms" value="yes" required><span>I agree to the <a href="{{ url_for('main.terms_of_service') }}" target="_blank">Terms</a>, <a href="{{ url_for('main.privacy_policy') }}" target="_blank">Privacy Policy</a>, and <a href="{{ url_for('main.acceptable_use_policy') }}" target="_blank">Acceptable Use Policy</a>.</span></label>
                     <button class="admin-login-button" type="submit">Create {{ account_role.value }} account <i class="bi bi-arrow-right"></i></button>
                 </form>
                 <p class="auth-switch">Already have an account? <a href="{{ url_for('main.account_login', role_name=account_role.value) }}">Sign in</a></p>

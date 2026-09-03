@@ -55,6 +55,11 @@ ClamAV signature updates, persistent volumes, health checks, and backup/restore
 commands, follow `deployment/DEPLOYMENT.md` and use
 `docker-compose.production.yml`.
 
+Before a release, create the private `.env.production` file and TLS files, then
+run `powershell -File deployment/preflight.ps1`. The checker does not display
+secret values and fails when required configuration, certificates, regression
+tests, migrations, Docker, or the Compose configuration are not ready.
+
 ## Verification
 
 Run the two regression scripts:
