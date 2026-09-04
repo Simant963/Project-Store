@@ -26,6 +26,13 @@ def create_app():
         "DATABASE_URL", "sqlite:///database.db"
     )
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    if app.config["APP_ENV"] == "production":
+        app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+            "pool_pre_ping": True,
+            "pool_recycle": 300,
+            "pool_size": 10,
+            "max_overflow": 20,
+        }
     app.config["SECRET_KEY"] = os.getenv("SECRET_KEY") or secrets.token_hex(32)
     app.config["SESSION_COOKIE_HTTPONLY"] = True
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
@@ -34,13 +41,24 @@ def create_app():
     ).lower() in {"1", "true", "yes"}
     app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
     app.config["SESSION_REFRESH_EACH_REQUEST"] = False
-    app.config["PUBLIC_BASE_URL"] = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:5001").rstrip("/")
+    app.config["SEND_FILE_MAX_AGE_DEFAULT"] = (
+        timedelta(days=7) if app.config["APP_ENV"] == "production" else None
+    )
+    app.config["PUBLIC_BASE_URL"] = os.getenv(
+        "PUBLIC_BASE_URL", "http://127.0.0.1:5001"
+    ).rstrip("/")
     app.config["SMTP_HOST"] = os.getenv("SMTP_HOST")
     app.config["SMTP_PORT"] = int(os.getenv("SMTP_PORT", "587"))
     app.config["SMTP_USERNAME"] = os.getenv("SMTP_USERNAME")
     app.config["SMTP_PASSWORD"] = os.getenv("SMTP_PASSWORD")
-    app.config["SMTP_FROM_EMAIL"] = os.getenv("SMTP_FROM_EMAIL", "no-reply@appora.local")
-    app.config["SMTP_USE_TLS"] = os.getenv("SMTP_USE_TLS", "true").lower() in {"1", "true", "yes"}
+    app.config["SMTP_FROM_EMAIL"] = os.getenv(
+        "SMTP_FROM_EMAIL", "no-reply@appora.local"
+    )
+    app.config["SMTP_USE_TLS"] = os.getenv("SMTP_USE_TLS", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
     app.config["ADMIN_USERNAME"] = os.getenv("ADMIN_USERNAME", "admin")
     app.config["ADMIN_EMAIL"] = os.getenv("ADMIN_EMAIL", "admin@appora.local")
     app.config["ADMIN_PASSWORD"] = os.getenv("ADMIN_PASSWORD")
@@ -54,21 +72,37 @@ def create_app():
     app.config["APP_SCREENSHOT_MAX_BYTES"] = 8 * 1024 * 1024
     app.config["APK_MAX_BYTES"] = 200 * 1024 * 1024
     app.config["CLAMAV_COMMAND"] = os.getenv("CLAMAV_COMMAND", "clamscan")
-    app.config["CLAMAV_TIMEOUT_SECONDS"] = int(os.getenv("CLAMAV_TIMEOUT_SECONDS", "180"))
-    app.config["AUTO_MIGRATE"] = os.getenv("AUTO_MIGRATE", "false").lower() in {"1", "true", "yes"}
-    app.config["TRUST_PROXY"] = os.getenv("TRUST_PROXY", "false").lower() in {"1", "true", "yes"}
+    app.config["CLAMAV_TIMEOUT_SECONDS"] = int(
+        os.getenv("CLAMAV_TIMEOUT_SECONDS", "180")
+    )
+    app.config["AUTO_MIGRATE"] = os.getenv("AUTO_MIGRATE", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    app.config["TRUST_PROXY"] = os.getenv("TRUST_PROXY", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
     app.config["POLICY_VERSION"] = os.getenv("POLICY_VERSION", "2026-09-03")
     app.config["LEGAL_OPERATOR_NAME"] = os.getenv("LEGAL_OPERATOR_NAME", "Appora")
     app.config["LEGAL_ADDRESS"] = os.getenv("LEGAL_ADDRESS", "India")
     app.config["SUPPORT_EMAIL"] = os.getenv("SUPPORT_EMAIL", "support@appora.local")
     app.config["PRIVACY_EMAIL"] = os.getenv("PRIVACY_EMAIL", "privacy@appora.local")
-    app.config["GRIEVANCE_OFFICER_NAME"] = os.getenv("GRIEVANCE_OFFICER_NAME", "Appora Grievance Officer")
-    app.config["GRIEVANCE_EMAIL"] = os.getenv("GRIEVANCE_EMAIL", "grievance@appora.local")
+    app.config["GRIEVANCE_OFFICER_NAME"] = os.getenv(
+        "GRIEVANCE_OFFICER_NAME", "Appora Grievance Officer"
+    )
+    app.config["GRIEVANCE_EMAIL"] = os.getenv(
+        "GRIEVANCE_EMAIL", "grievance@appora.local"
+    )
     if app.config["APP_ENV"] == "production":
         configuration_errors = []
         configured_secret = os.getenv("SECRET_KEY", "")
         if len(configured_secret) < 32 or configured_secret.startswith("replace-"):
-            configuration_errors.append("SECRET_KEY must be a unique value of at least 32 characters")
+            configuration_errors.append(
+                "SECRET_KEY must be a unique value of at least 32 characters"
+            )
         if app.debug:
             configuration_errors.append("FLASK_DEBUG must be false")
         if not app.config["SESSION_COOKIE_SECURE"]:
@@ -78,36 +112,58 @@ def create_app():
         if not app.config["SQLALCHEMY_DATABASE_URI"].startswith(
             ("postgresql://", "postgresql+psycopg://")
         ):
-            configuration_errors.append("DATABASE_URL must use PostgreSQL in production")
+            configuration_errors.append(
+                "DATABASE_URL must use PostgreSQL in production"
+            )
         if not app.config["TRUST_PROXY"]:
-            configuration_errors.append("TRUST_PROXY must be true behind the production HTTPS proxy")
+            configuration_errors.append(
+                "TRUST_PROXY must be true behind the production HTTPS proxy"
+            )
         if app.config["AUTO_MIGRATE"]:
             configuration_errors.append("AUTO_MIGRATE must be false in production")
         if not os.getenv("PRIVATE_UPLOAD_ROOT"):
-            configuration_errors.append("PRIVATE_UPLOAD_ROOT must point to durable mounted storage")
+            configuration_errors.append(
+                "PRIVATE_UPLOAD_ROOT must point to durable mounted storage"
+            )
         elif not Path(app.config["PRIVATE_UPLOAD_ROOT"]).is_absolute():
-            configuration_errors.append("PRIVATE_UPLOAD_ROOT must be an absolute production path")
+            configuration_errors.append(
+                "PRIVATE_UPLOAD_ROOT must be an absolute production path"
+            )
         if not app.config["SMTP_HOST"]:
-            configuration_errors.append("SMTP_HOST is required for password-reset email")
-        if not app.config["SMTP_FROM_EMAIL"] or app.config["SMTP_FROM_EMAIL"].endswith(".local"):
+            configuration_errors.append(
+                "SMTP_HOST is required for password-reset email"
+            )
+        if not app.config["SMTP_FROM_EMAIL"] or app.config["SMTP_FROM_EMAIL"].endswith(
+            ".local"
+        ):
             configuration_errors.append("SMTP_FROM_EMAIL must be a real sender address")
         for key in ("SUPPORT_EMAIL", "PRIVACY_EMAIL", "GRIEVANCE_EMAIL"):
             if not app.config[key] or app.config[key].endswith(".local"):
                 configuration_errors.append(f"{key} must be a real monitored address")
         if not os.getenv("LEGAL_OPERATOR_NAME") or not os.getenv("LEGAL_ADDRESS"):
-            configuration_errors.append("LEGAL_OPERATOR_NAME and LEGAL_ADDRESS are required")
+            configuration_errors.append(
+                "LEGAL_OPERATOR_NAME and LEGAL_ADDRESS are required"
+            )
         if not os.getenv("GRIEVANCE_OFFICER_NAME"):
             configuration_errors.append("GRIEVANCE_OFFICER_NAME is required")
         if bool(app.config["SMTP_USERNAME"]) != bool(app.config["SMTP_PASSWORD"]):
-            configuration_errors.append("SMTP_USERNAME and SMTP_PASSWORD must be configured together")
+            configuration_errors.append(
+                "SMTP_USERNAME and SMTP_PASSWORD must be configured together"
+            )
         clamav_command = app.config["CLAMAV_COMMAND"]
         if not (shutil.which(clamav_command) or Path(clamav_command).is_file()):
-            configuration_errors.append("CLAMAV_COMMAND must resolve to an installed ClamAV scanner")
+            configuration_errors.append(
+                "CLAMAV_COMMAND must resolve to an installed ClamAV scanner"
+            )
         admin_password = app.config["ADMIN_PASSWORD"] or ""
         if len(admin_password) < 12 or admin_password.startswith("replace-"):
-            configuration_errors.append("ADMIN_PASSWORD must contain at least 12 characters")
+            configuration_errors.append(
+                "ADMIN_PASSWORD must contain at least 12 characters"
+            )
         if configuration_errors:
-            raise RuntimeError("Unsafe production configuration: " + "; ".join(configuration_errors))
+            raise RuntimeError(
+                "Unsafe production configuration: " + "; ".join(configuration_errors)
+            )
     if app.config["TRUST_PROXY"]:
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
     for folder in ("developer_ids", "app_icons", "app_screenshots", "apks"):
@@ -122,10 +178,14 @@ def create_app():
     def apply_security_headers(response):
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "DENY")
-        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault(
+            "Referrer-Policy", "strict-origin-when-cross-origin"
+        )
         response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
         response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
-        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        response.headers.setdefault(
+            "Permissions-Policy", "camera=(), microphone=(), geolocation=()"
+        )
         response.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'self'; img-src 'self' data:; "
@@ -142,10 +202,17 @@ def create_app():
     @app.before_request
     def limit_sensitive_request_sizes():
         sensitive_endpoints = {
-            "main.admin_login", "main.account_login", "main.create_account",
-            "main.forgot_password", "main.reset_password", "main.account_settings",
+            "main.admin_login",
+            "main.account_login",
+            "main.create_account",
+            "main.forgot_password",
+            "main.reset_password",
+            "main.account_settings",
         }
-        if request.endpoint in sensitive_endpoints and (request.content_length or 0) > 64 * 1024:
+        if (
+            request.endpoint in sensitive_endpoints
+            and (request.content_length or 0) > 64 * 1024
+        ):
             abort(413)
 
     @app.get("/health")
@@ -166,15 +233,21 @@ def create_app():
                 migration_context = MigrationContext.configure(connection)
                 current_revision = migration_context.get_current_revision()
             migration_config = app.extensions["migrate"].migrate.get_config()
-            head_revision = ScriptDirectory.from_config(migration_config).get_current_head()
-            checks["schema"] = bool(current_revision and current_revision == head_revision)
+            head_revision = ScriptDirectory.from_config(
+                migration_config
+            ).get_current_head()
+            checks["schema"] = bool(
+                current_revision and current_revision == head_revision
+            )
         except Exception:
             db.session.rollback()
             app.logger.exception("Readiness database check failed.")
 
         try:
             upload_root = Path(app.config["PRIVATE_UPLOAD_ROOT"]).resolve()
-            checks["private_storage"] = upload_root.is_dir() and os.access(upload_root, os.R_OK | os.W_OK)
+            checks["private_storage"] = upload_root.is_dir() and os.access(
+                upload_root, os.R_OK | os.W_OK
+            )
         except OSError:
             app.logger.exception("Readiness private storage check failed.")
 
@@ -188,41 +261,81 @@ def create_app():
             )
 
         ready = all(checks.values())
-        response = jsonify({"status": "ready" if ready else "not_ready", "checks": checks})
+        response = jsonify(
+            {"status": "ready" if ready else "not_ready", "checks": checks}
+        )
         response.status_code = 200 if ready else 503
         response.headers["Cache-Control"] = "no-store"
         return response
 
     def render_safe_error(status_code, title, message, icon):
-        return render_template("error.html", status_code=status_code, title=title, message=message, icon=icon), status_code
+        return render_template(
+            "error.html",
+            status_code=status_code,
+            title=title,
+            message=message,
+            icon=icon,
+        ), status_code
 
     @app.errorhandler(400)
     def bad_request_error(error):
-        return render_safe_error(400, "That request could not be completed", "The form may have expired or contained invalid information. Please return and try again.", "bi-exclamation-circle")
+        return render_safe_error(
+            400,
+            "That request could not be completed",
+            "The form may have expired or contained invalid information. Please return and try again.",
+            "bi-exclamation-circle",
+        )
 
     @app.errorhandler(403)
     def forbidden_error(error):
-        return render_safe_error(403, "Access is not allowed", "You do not have permission to open this page or perform this action.", "bi-shield-lock")
+        return render_safe_error(
+            403,
+            "Access is not allowed",
+            "You do not have permission to open this page or perform this action.",
+            "bi-shield-lock",
+        )
 
     @app.errorhandler(404)
     def not_found_error(error):
-        return render_safe_error(404, "Page not found", "The page may have moved, been removed, or never existed.", "bi-compass")
+        return render_safe_error(
+            404,
+            "Page not found",
+            "The page may have moved, been removed, or never existed.",
+            "bi-compass",
+        )
 
     @app.errorhandler(413)
     def request_too_large_error(error):
-        return render_safe_error(413, "Upload is too large", "The submitted request exceeds the allowed size. Choose a smaller file and try again.", "bi-file-earmark-x")
+        return render_safe_error(
+            413,
+            "Upload is too large",
+            "The submitted request exceeds the allowed size. Choose a smaller file and try again.",
+            "bi-file-earmark-x",
+        )
 
     @app.errorhandler(429)
     def rate_limit_error(error):
-        response, status = render_safe_error(429, "Too many requests", "Please wait a few minutes before trying again.", "bi-hourglass-split")
+        response, status = render_safe_error(
+            429,
+            "Too many requests",
+            "Please wait a few minutes before trying again.",
+            "bi-hourglass-split",
+        )
         response.headers["Retry-After"] = "900"
         return response, status
 
     @app.errorhandler(500)
     def internal_error(error):
         db.session.rollback()
-        app.logger.error("Unhandled application error", exc_info=error.original_exception or error)
-        return render_safe_error(500, "Something went wrong", "The request could not be completed. Your saved data was not partially changed.", "bi-tools")
+        app.logger.error(
+            "Unhandled application error", exc_info=error.original_exception or error
+        )
+        return render_safe_error(
+            500,
+            "Something went wrong",
+            "The request could not be completed. Your saved data was not partially changed.",
+            "bi-tools",
+        )
 
     from application.controllers import main
 
@@ -256,7 +369,9 @@ def create_app():
         if not set(User.__table__.columns.keys()).issubset(database_user_columns):
             return app
         with db.engine.connect() as connection:
-            current_revision = MigrationContext.configure(connection).get_current_revision()
+            current_revision = MigrationContext.configure(
+                connection
+            ).get_current_revision()
         migration_config = app.extensions["migrate"].migrate.get_config()
         head_revision = ScriptDirectory.from_config(migration_config).get_current_head()
         if current_revision != head_revision:

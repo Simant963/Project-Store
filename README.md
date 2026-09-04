@@ -42,7 +42,7 @@ Deploy in this order:
 ```text
 flask --app app db upgrade
 flask --app app production-check
-gunicorn --workers 3 --bind 0.0.0.0:$PORT app:app
+gunicorn --workers 3 --worker-class gthread --threads 2 --keep-alive 5 --timeout 300 --bind 0.0.0.0:$PORT app:app
 ```
 
 The included `Procfile` runs the database migration as its release command.
@@ -56,7 +56,8 @@ commands, follow `deployment/DEPLOYMENT.md` and use
 `docker-compose.production.yml`.
 
 Before a release, create the private `.env.production` file and TLS files, then
-run `powershell -File deployment/preflight.ps1`. The checker does not display
+run `powershell -NoProfile -ExecutionPolicy Bypass -File deployment/preflight.ps1`.
+The checker does not display
 secret values and fails when required configuration, certificates, regression
 tests, migrations, Docker, or the Compose configuration are not ready.
 

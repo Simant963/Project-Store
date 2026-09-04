@@ -28,7 +28,7 @@ from flask import (
     stream_with_context,
     url_for,
 )
-from sqlalchemy import func, or_
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import joinedload, selectinload
 from werkzeug.utils import secure_filename
@@ -596,7 +596,9 @@ def unique_app_slug(name):
     return slug
 
 
-def send_private_upload(folder, filename, download_name=None, as_attachment=False):
+def send_private_upload(
+    folder, filename, download_name=None, as_attachment=False, public_cache=False
+):
     if not filename or Path(filename).name != filename:
         abort(404)
     directory = private_upload_folder(folder)
@@ -610,8 +612,11 @@ def send_private_upload(folder, filename, download_name=None, as_attachment=Fals
         conditional=True,
     )
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Cache-Control"] = "private, no-store"
-    response.headers["Pragma"] = "no-cache"
+    if public_cache:
+        response.headers["Cache-Control"] = "public, max-age=86400, immutable"
+    else:
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["Pragma"] = "no-cache"
     return response
 
 
@@ -1645,7 +1650,9 @@ def app_detail(slug):
     app_record = (
         StoreApp.query.options(
             joinedload(StoreApp.developer),
-            selectinload(StoreApp.reviews).joinedload(AppReview.user),
+            selectinload(
+                StoreApp.reviews.and_(AppReview.status == ReviewStatus.PUBLISHED)
+            ).joinedload(AppReview.user),
             selectinload(StoreApp.screenshots),
         )
         .filter_by(slug=slug, status=AppStatus.APPROVED)
@@ -1663,16 +1670,14 @@ def app_detail(slug):
         viewer_review = AppReview.query.filter_by(
             user_id=viewer.id, app_id=app_record.id
         ).first()
-        is_saved = (
-            SavedApp.query.filter_by(user_id=viewer.id, app_id=app_record.id).first()
-            is not None
-        )
-        has_downloaded = (
-            DownloadRecord.query.filter_by(
-                user_id=viewer.id, app_id=app_record.id
-            ).first()
-            is not None
-        )
+        is_saved, has_downloaded = db.session.query(
+            db.session.query(SavedApp.id)
+            .filter_by(user_id=viewer.id, app_id=app_record.id)
+            .exists(),
+            db.session.query(DownloadRecord.id)
+            .filter_by(user_id=viewer.id, app_id=app_record.id)
+            .exists(),
+        ).one()
     reviews = sorted(
         app_record.published_reviews,
         key=lambda review: review.updated_at,
@@ -1845,7 +1850,11 @@ def app_icon(app_id):
     )
     if not can_view:
         abort(404)
-    return send_private_upload("app_icons", app_record.icon_file)
+    return send_private_upload(
+        "app_icons",
+        app_record.icon_file,
+        public_cache=app_record.status == AppStatus.APPROVED,
+    )
 
 
 @main.get("/apps/screenshots/<int:screenshot_id>")
@@ -1863,7 +1872,11 @@ def app_screenshot(screenshot_id):
     )
     if not can_view:
         abort(404)
-    return send_private_upload("app_screenshots", screenshot.file_name)
+    return send_private_upload(
+        "app_screenshots",
+        screenshot.file_name,
+        public_cache=screenshot.app.status == AppStatus.APPROVED,
+    )
 
 
 @main.route("/admin")
@@ -1900,15 +1913,19 @@ def admin_dashboard(admin):
         User.created_at.desc(), User.id.desc()
     ).paginate(page=page, per_page=20, error_out=False)
     accounts = pagination.items
-    counts = {
-        "total": User.query.filter(
-            User.role.notin_([UserRole.ADMIN, UserRole.CO_ADMIN]),
-            User.status != AccountStatus.DELETED,
-        ).count(),
-        "pending": User.query.filter(User.status == AccountStatus.PENDING).count(),
-        "developers": User.query.filter(User.role == UserRole.DEVELOPER).count(),
-        "blocked": User.query.filter(User.status == AccountStatus.BLOCKED).count(),
-    }
+    count_row = db.session.query(
+        func.count(
+            case(
+                (User.role.notin_([UserRole.ADMIN, UserRole.CO_ADMIN]))
+                & (User.status != AccountStatus.DELETED),
+                1,
+            )
+        ),
+        func.count(case((User.status == AccountStatus.PENDING, 1))),
+        func.count(case((User.role == UserRole.DEVELOPER, 1))),
+        func.count(case((User.status == AccountStatus.BLOCKED, 1))),
+    ).one()
+    counts = dict(zip(("total", "pending", "developers", "blocked"), count_row))
     return render_template(
         "admin_dashboard.html",
         admin=admin,
@@ -1979,13 +1996,20 @@ def admin_moderation(admin):
         .limit(100)
         .all()
     )
-    counts = {
-        "open_reports": AppReport.query.filter_by(status=ReportStatus.OPEN).count(),
-        "published_reviews": AppReview.query.filter_by(
-            status=ReviewStatus.PUBLISHED
-        ).count(),
-        "hidden_reviews": AppReview.query.filter_by(status=ReviewStatus.HIDDEN).count(),
-    }
+    count_row = db.session.query(
+        db.session.query(func.count(AppReport.id))
+        .filter(AppReport.status == ReportStatus.OPEN)
+        .scalar_subquery(),
+        db.session.query(func.count(AppReview.id))
+        .filter(AppReview.status == ReviewStatus.PUBLISHED)
+        .scalar_subquery(),
+        db.session.query(func.count(AppReview.id))
+        .filter(AppReview.status == ReviewStatus.HIDDEN)
+        .scalar_subquery(),
+    ).one()
+    counts = dict(
+        zip(("open_reports", "published_reviews", "hidden_reviews"), count_row)
+    )
     return render_template(
         "admin_moderation.html",
         admin=admin,
@@ -2290,17 +2314,17 @@ def admin_apps(admin):
         StoreApp.submitted_at.desc(), StoreApp.id.desc()
     ).paginate(page=page, per_page=20, error_out=False)
     apps = pagination.items
-    counts = {
-        "total": StoreApp.query.filter(StoreApp.status != AppStatus.DELETED).count(),
-        "pending": StoreApp.query.filter(
-            or_(
-                StoreApp.status == AppStatus.PENDING,
-                StoreApp.pending_release_status == ReleaseStatus.PENDING,
-            )
-        ).count(),
-        "approved": StoreApp.query.filter_by(status=AppStatus.APPROVED).count(),
-        "blocked": StoreApp.query.filter_by(status=AppStatus.BLOCKED).count(),
-    }
+    pending_condition = or_(
+        StoreApp.status == AppStatus.PENDING,
+        StoreApp.pending_release_status == ReleaseStatus.PENDING,
+    )
+    count_row = db.session.query(
+        func.count(case((StoreApp.status != AppStatus.DELETED, 1))),
+        func.count(case((pending_condition, 1))),
+        func.count(case((StoreApp.status == AppStatus.APPROVED, 1))),
+        func.count(case((StoreApp.status == AppStatus.BLOCKED, 1))),
+    ).one()
+    counts = dict(zip(("total", "pending", "approved", "blocked"), count_row))
     return render_template(
         "admin_apps.html",
         admin=admin,
@@ -2832,18 +2856,19 @@ def manage_account(admin, user_id, action):
 @main.route("/user/dashboard")
 @role_required(UserRole.USER)
 def user_dashboard(user):
-    download_records = (
+    download_count = DownloadRecord.query.filter_by(user_id=user.id).count()
+    latest_download_ids = (
+        db.session.query(func.max(DownloadRecord.id).label("id"))
+        .filter(DownloadRecord.user_id == user.id)
+        .group_by(DownloadRecord.app_id)
+        .subquery()
+    )
+    recent_downloads = (
         DownloadRecord.query.options(joinedload(DownloadRecord.app))
-        .filter_by(user_id=user.id)
+        .filter(DownloadRecord.id.in_(select(latest_download_ids.c.id)))
         .order_by(DownloadRecord.downloaded_at.desc())
         .all()
     )
-    recent_downloads = []
-    seen_app_ids = set()
-    for record in download_records:
-        if record.app_id not in seen_app_ids:
-            recent_downloads.append(record)
-            seen_app_ids.add(record.app_id)
     saved_apps = (
         SavedApp.query.options(joinedload(SavedApp.app))
         .filter_by(user_id=user.id)
@@ -2860,7 +2885,7 @@ def user_dashboard(user):
         "user_dashboard.html",
         user=user,
         recent_downloads=recent_downloads,
-        download_count=len(download_records),
+        download_count=download_count,
         saved_apps=saved_apps,
         reviews=reviews,
         csrf_token=get_csrf_token(),
@@ -3003,7 +3028,11 @@ def developer_dashboard(user):
         )
         return redirect(url_for("main.developer_verification"))
     apps = (
-        StoreApp.query.options(selectinload(StoreApp.reviews))
+        StoreApp.query.options(
+            selectinload(
+                StoreApp.reviews.and_(AppReview.status == ReviewStatus.PUBLISHED)
+            )
+        )
         .filter_by(developer_id=user.id)
         .order_by(
             StoreApp.submitted_at.desc(),
@@ -3029,15 +3058,22 @@ def developer_dashboard(user):
             .all()
         )
         start_day = (datetime.now(timezone.utc) - timedelta(days=6)).date()
-        tracked = DownloadRecord.query.filter(
-            DownloadRecord.app_id.in_(approved_app_ids),
-            DownloadRecord.downloaded_at
-            >= datetime.combine(start_day, datetime.min.time(), tzinfo=timezone.utc),
-        ).all()
-        downloads_by_day = {}
-        for record in tracked:
-            day = aware_datetime(record.downloaded_at).date()
-            downloads_by_day[day] = downloads_by_day.get(day, 0) + 1
+        day_expression = func.date(DownloadRecord.downloaded_at)
+        tracked = (
+            db.session.query(day_expression.label("day"), func.count().label("count"))
+            .filter(
+                DownloadRecord.app_id.in_(approved_app_ids),
+                DownloadRecord.downloaded_at
+                >= datetime.combine(
+                    start_day, datetime.min.time(), tzinfo=timezone.utc
+                ),
+            )
+            .group_by(day_expression)
+            .all()
+        )
+        downloads_by_day = {
+            datetime.strptime(day, "%Y-%m-%d").date(): count for day, count in tracked
+        }
         seven_day_downloads = [
             {
                 "date": start_day + timedelta(days=offset),

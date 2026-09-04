@@ -15,7 +15,7 @@
 4. Run the local release preflight. It validates settings without displaying secret values:
 
    ```text
-   powershell -File deployment/preflight.ps1
+   powershell -NoProfile -ExecutionPolicy Bypass -File deployment/preflight.ps1
    ```
 
 5. Build and start the stack:
