@@ -43,11 +43,11 @@ def upgrade():
 
     if 'user' in tables:
         connection.execute(sa.text(
-            "UPDATE user SET email = 'legacy-user-' || id || '@invalid.local' "
+            "UPDATE \"user\" SET email = 'legacy-user-' || id || '@invalid.local' "
             "WHERE email IS NULL OR TRIM(email) = ''"
         ))
         connection.execute(sa.text(
-            "UPDATE user SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"
+            "UPDATE \"user\" SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"
         ))
         user_columns = {column['name']: column for column in inspector.get_columns('user')}
         user_indexes = {index['name'] for index in inspector.get_indexes('user')}

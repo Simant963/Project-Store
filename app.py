@@ -11,6 +11,7 @@ from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from flask_migrate import upgrade
 from sqlalchemy import inspect, text
+from sqlalchemy.exc import IntegrityError
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from application.database import db, migrate
@@ -388,7 +389,14 @@ def create_app():
             admin.set_password(admin_password)
             admin.approve()
             db.session.add(admin)
-            db.session.commit()
+            try:
+                db.session.commit()
+            except IntegrityError:
+                db.session.rollback()
+                if not User.query.filter_by(
+                    username=app.config["ADMIN_USERNAME"]
+                ).first():
+                    raise
         elif admin is not None:
             admin.role = UserRole.ADMIN
             admin.status = AccountStatus.APPROVED
