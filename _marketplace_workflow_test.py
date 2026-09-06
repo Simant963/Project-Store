@@ -94,6 +94,19 @@ try:
     assert missing_page.status_code == 404 and b"Page not found" in missing_page.data
     ready = app.test_client().get("/ready")
     assert ready.status_code == 200 and ready.get_json()["status"] == "ready"
+    admin_client = app.test_client()
+    admin_token = csrf(admin_client, "/admin/login")
+    admin_dashboard = admin_client.post(
+        "/admin/login",
+        data={
+            "csrf_token": admin_token,
+            "identifier": "workflow_admin",
+            "password": "AdminPass123!",
+        },
+        follow_redirects=True,
+    )
+    assert admin_dashboard.status_code == 200
+    assert admin_dashboard.request.path == "/admin"
     (uploads / "app_icons").mkdir(parents=True, exist_ok=True)
     (uploads / "apks").mkdir(parents=True, exist_ok=True)
     (uploads / "app_icons" / "icon.png").write_bytes(b"icon")

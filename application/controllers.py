@@ -670,7 +670,7 @@ def home():
         .limit(6)
         .all()
     )
-    return render_template("home.html", approved_apps=approved_apps)
+    return render_template("universe.html", approved_apps=approved_apps)
 
 
 @main.get("/policies")
@@ -1916,9 +1916,11 @@ def admin_dashboard(admin):
     count_row = db.session.query(
         func.count(
             case(
-                (User.role.notin_([UserRole.ADMIN, UserRole.CO_ADMIN]))
-                & (User.status != AccountStatus.DELETED),
-                1,
+                (
+                    (User.role.notin_([UserRole.ADMIN, UserRole.CO_ADMIN]))
+                    & (User.status != AccountStatus.DELETED),
+                    1,
+                )
             )
         ),
         func.count(case((User.status == AccountStatus.PENDING, 1))),
