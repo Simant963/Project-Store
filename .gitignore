@@ -10,5 +10,6 @@ instance/
 !.env.example
 !.env.production.example
 backups/
+test-accounts.txt
 deployment/certs/*
 !deployment/certs/.gitkeep

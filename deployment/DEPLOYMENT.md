@@ -6,6 +6,7 @@
 - A domain whose DNS points to the server.
 - TLS files at `deployment/certs/fullchain.pem` and `deployment/certs/privkey.pem`.
 - SMTP credentials for password-reset email.
+- A Supabase PostgreSQL session-pooler connection string.
 
 ## First deployment
 
@@ -31,8 +32,17 @@
    docker compose --env-file .env.production -f docker-compose.production.yml exec web flask --app app production-check
    ```
 
+7. Run the authenticated role load test against staging before opening public
+   traffic. Set the `LOAD_<ROLE>_USERNAME` and `LOAD_<ROLE>_PASSWORD` variables
+   for admin, co-admin, developer, and user test accounts, then run:
+
+   ```text
+   python _role_load_test.py --url https://staging.example.com --concurrency 1000
+   ```
+
 The proxy redirects HTTP traffic to HTTPS. Only ports 80 and 443 are exposed;
-PostgreSQL and Gunicorn remain on the private container network.
+Redis and Gunicorn remain on the private container network. PostgreSQL is
+provided by Supabase over an SSL connection.
 
 ## Backups
 

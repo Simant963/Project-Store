@@ -6,12 +6,14 @@ from pathlib import Path
 
 import click
 from dotenv import load_dotenv
-from flask import Flask, abort, jsonify, render_template, request
+from flask import Flask, abort, g, jsonify, render_template, request, session
+from urllib.parse import urlparse
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from flask_migrate import upgrade
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
+from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from application.database import db, migrate
@@ -22,11 +24,20 @@ load_dotenv()
 def create_app():
     app = Flask(__name__)
     app.config["APP_ENV"] = os.getenv("APP_ENV", "development").lower()
-    app.debug = os.getenv("FLASK_DEBUG", "false").lower() in {"1", "true", "yes"}
+    requested_debug = os.getenv("FLASK_DEBUG", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    # The interactive debugger can expose secrets and request data in a browser.
+    app.debug = False
+    app.config["PROPAGATE_EXCEPTIONS"] = False
+    app.config["TRAP_HTTP_EXCEPTIONS"] = False
     app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
         "DATABASE_URL", "sqlite:///database.db"
     )
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    app.config["REDIS_URL"] = os.getenv("REDIS_URL")
     if app.config["APP_ENV"] == "production":
         app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
             "pool_pre_ping": True,
@@ -48,6 +59,12 @@ def create_app():
     app.config["PUBLIC_BASE_URL"] = os.getenv(
         "PUBLIC_BASE_URL", "http://127.0.0.1:5001"
     ).rstrip("/")
+    if app.config["APP_ENV"] == "production":
+        app.config["TRUSTED_HOSTS"] = [
+            urlparse(app.config["PUBLIC_BASE_URL"]).hostname,
+            "127.0.0.1",
+            "localhost",
+        ]
     app.config["SMTP_HOST"] = os.getenv("SMTP_HOST")
     app.config["SMTP_PORT"] = int(os.getenv("SMTP_PORT", "587"))
     app.config["SMTP_USERNAME"] = os.getenv("SMTP_USERNAME")
@@ -64,6 +81,9 @@ def create_app():
     app.config["ADMIN_EMAIL"] = os.getenv("ADMIN_EMAIL", "admin@appora.local")
     app.config["ADMIN_PASSWORD"] = os.getenv("ADMIN_PASSWORD")
     app.config["MAX_CONTENT_LENGTH"] = 220 * 1024 * 1024
+    # Keep multipart metadata in memory bounded even when a large APK is allowed.
+    app.config["MAX_FORM_MEMORY_SIZE"] = 2 * 1024 * 1024
+    app.config["MAX_FORM_PARTS"] = 50
     app.config["PRIVATE_UPLOAD_ROOT"] = os.getenv(
         "PRIVATE_UPLOAD_ROOT",
         str(Path(app.instance_path) / "uploads"),
@@ -86,7 +106,7 @@ def create_app():
         "true",
         "yes",
     }
-    app.config["POLICY_VERSION"] = os.getenv("POLICY_VERSION", "2026-09-03")
+    app.config["POLICY_VERSION"] = os.getenv("POLICY_VERSION", "2026-09-24")
     app.config["LEGAL_OPERATOR_NAME"] = os.getenv("LEGAL_OPERATOR_NAME", "Appora")
     app.config["LEGAL_ADDRESS"] = os.getenv("LEGAL_ADDRESS", "India")
     app.config["SUPPORT_EMAIL"] = os.getenv("SUPPORT_EMAIL", "support@appora.local")
@@ -104,7 +124,7 @@ def create_app():
             configuration_errors.append(
                 "SECRET_KEY must be a unique value of at least 32 characters"
             )
-        if app.debug:
+        if requested_debug:
             configuration_errors.append("FLASK_DEBUG must be false")
         if not app.config["SESSION_COOKIE_SECURE"]:
             configuration_errors.append("SESSION_COOKIE_SECURE must be true")
@@ -115,6 +135,10 @@ def create_app():
         ):
             configuration_errors.append(
                 "DATABASE_URL must use PostgreSQL in production"
+            )
+        if not app.config["REDIS_URL"]:
+            configuration_errors.append(
+                "REDIS_URL is required for cross-worker live updates"
             )
         if not app.config["TRUST_PROXY"]:
             configuration_errors.append(
@@ -175,6 +199,16 @@ def create_app():
     db.init_app(app)
     migrate.init_app(app, db)
 
+    @app.before_request
+    def create_csp_nonce():
+        # Also neutralize `flask --debug`; reloading may be used, the web debugger may not.
+        app.debug = False
+        g.csp_nonce = secrets.token_urlsafe(18)
+
+    @app.context_processor
+    def security_template_values():
+        return {"csp_nonce": g.csp_nonce}
+
     @app.after_request
     def apply_security_headers(response):
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -184,16 +218,38 @@ def create_app():
         )
         response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
         response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+        response.headers.setdefault("Origin-Agent-Cluster", "?1")
+        response.headers.setdefault("X-Permitted-Cross-Domain-Policies", "none")
         response.headers.setdefault(
             "Permissions-Policy", "camera=(), microphone=(), geolocation=()"
         )
+        if response.status_code >= 400:
+            response.headers["Cache-Control"] = "private, no-store"
+            response.headers["Pragma"] = "no-cache"
         response.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'self'; img-src 'self' data:; "
             "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
             "font-src 'self' https://cdn.jsdelivr.net https://fonts.gstatic.com; "
-            "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; connect-src 'self'",
+            f"script-src 'self' 'nonce-{g.csp_nonce}' https://cdn.jsdelivr.net; "
+            "connect-src 'self'; object-src 'none'; base-uri 'self'; "
+            "form-action 'self'; frame-ancestors 'none'; manifest-src 'self'",
         )
+        if response.mimetype == "text/html" and (
+            session.get("user_id")
+            or request.endpoint
+            in {
+                "main.admin_login",
+                "main.account_login",
+                "main.forgot_password",
+                "main.security_question_recovery",
+                "main.reset_password",
+            }
+        ):
+            response.headers["Cache-Control"] = "private, no-store"
+            response.headers["Pragma"] = "no-cache"
+        if request.endpoint == "main.reset_password":
+            response.headers["Referrer-Policy"] = "no-referrer"
         if app.config["SESSION_COOKIE_SECURE"]:
             response.headers.setdefault(
                 "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
@@ -207,6 +263,7 @@ def create_app():
             "main.account_login",
             "main.create_account",
             "main.forgot_password",
+            "main.security_question_recovery",
             "main.reset_password",
             "main.account_settings",
         }
@@ -325,16 +382,27 @@ def create_app():
         response.headers["Retry-After"] = "900"
         return response, status
 
-    @app.errorhandler(500)
+    @app.errorhandler(Exception)
     def internal_error(error):
         db.session.rollback()
+        if isinstance(error, HTTPException):
+            return render_safe_error(
+                error.code or 500,
+                "That request could not be completed",
+                "The requested action is not available.",
+                "bi-exclamation-circle",
+            )
+        incident_id = secrets.token_hex(6)
         app.logger.error(
-            "Unhandled application error", exc_info=error.original_exception or error
+            "Unhandled application error incident=%s endpoint=%s type=%s",
+            incident_id,
+            request.endpoint or "unknown",
+            type(error).__name__,
         )
         return render_safe_error(
             500,
             "Something went wrong",
-            "The request could not be completed. Your saved data was not partially changed.",
+            f"The request could not be completed. Reference: {incident_id}.",
             "bi-tools",
         )
 
@@ -402,8 +470,6 @@ def create_app():
             admin.status = AccountStatus.APPROVED
             if not admin.email:
                 admin.email = app.config["ADMIN_EMAIL"]
-            if admin_password and not admin.check_password(admin_password):
-                admin.set_password(admin_password)
             db.session.commit()
 
         username_index.rebuild(User.query.order_by(User.id).all())
@@ -414,4 +480,4 @@ def create_app():
 app = create_app()
 
 if __name__ == "__main__":
-    app.run()
+    app.run(debug=False, use_debugger=False)

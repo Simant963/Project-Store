@@ -1,7 +1,11 @@
+import json
+import os
 from datetime import datetime, timezone
 from queue import Empty, Full, Queue
 from threading import Lock
 from uuid import uuid4
+
+from redis import Redis
 
 
 class AccountEventBus:
@@ -41,4 +45,46 @@ class AccountEventBus:
         return payload
 
 
-account_events = AccountEventBus()
+class RedisSubscriber:
+    def __init__(self, client, channel):
+        self._pubsub = client.pubsub(ignore_subscribe_messages=True)
+        self._pubsub.subscribe(channel)
+
+    def get(self, timeout):
+        message = self._pubsub.get_message(timeout=timeout)
+        if message is None:
+            raise Empty
+        return json.loads(message["data"])
+
+    def close(self):
+        self._pubsub.close()
+
+
+class RedisEventBus:
+    """Cross-worker event fan-out for production SSE connections."""
+
+    def __init__(self, url, channel="appora-events"):
+        self._client = Redis.from_url(url, decode_responses=True)
+        self._channel = channel
+
+    def subscribe(self):
+        return RedisSubscriber(self._client, self._channel)
+
+    def unsubscribe(self, subscriber):
+        subscriber.close()
+
+    def publish(self, event):
+        payload = {
+            "event_id": uuid4().hex,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+            **event,
+        }
+        self._client.publish(self._channel, json.dumps(payload))
+        return payload
+
+
+account_events = (
+    RedisEventBus(os.environ["REDIS_URL"])
+    if os.getenv("REDIS_URL")
+    else AccountEventBus()
+)

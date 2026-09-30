@@ -1,19 +1,4 @@
 services:
-  db:
-    image: postgres:17-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
   clamav-updater:
     build: .
     restart: unless-stopped
@@ -21,6 +6,18 @@ services:
     command: ["freshclam", "--daemon", "--foreground=true"]
     volumes:
       - clamav_data:/var/lib/clamav
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   init-storage:
     build: .
@@ -33,10 +30,10 @@ services:
   migrate:
     build: .
     env_file: .env.production
+    environment:
+      REDIS_URL: redis://redis:6379/0
     command: ["flask", "--app", "app", "db", "upgrade"]
     depends_on:
-      db:
-        condition: service_healthy
       init-storage:
         condition: service_completed_successfully
     volumes:
@@ -48,11 +45,13 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env.production
+    environment:
+      REDIS_URL: redis://redis:6379/0
     depends_on:
-      db:
-        condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     volumes:
       - private_uploads:/data/appora/uploads
       - clamav_data:/var/lib/clamav:ro
@@ -77,6 +76,6 @@ services:
       - ./deployment/certs:/etc/nginx/certs:ro
 
 volumes:
-  postgres_data:
   private_uploads:
   clamav_data:
+  redis_data:

@@ -31,7 +31,8 @@ in a committed file.
 
 Required production services:
 
-- PostgreSQL through `DATABASE_URL`.
+- Supabase PostgreSQL through its session-pooler `DATABASE_URL`.
+- Redis through `REDIS_URL` for live updates across web workers.
 - A persistent mounted disk for `PRIVATE_UPLOAD_ROOT`.
 - An SMTP provider for password-reset messages.
 - ClamAV installed in the application image with current signatures.
@@ -42,7 +43,7 @@ Deploy in this order:
 ```text
 flask --app app db upgrade
 flask --app app production-check
-gunicorn --workers 3 --worker-class gthread --threads 2 --keep-alive 5 --timeout 300 --bind 0.0.0.0:$PORT app:app
+gunicorn --workers 4 --worker-class gevent --worker-connections 1200 --keep-alive 5 --timeout 300 --bind 0.0.0.0:$PORT app:app
 ```
 
 The included `Procfile` runs the database migration as its release command.
@@ -71,6 +72,14 @@ python _marketplace_workflow_test.py
 ```
 
 They use isolated temporary databases and do not alter local marketplace data.
+
+After staging is deployed, set the eight `LOAD_<ROLE>_USERNAME` and
+`LOAD_<ROLE>_PASSWORD` environment variables for the four test accounts, then
+verify a 1,000-request wave per role with:
+
+```text
+python _role_load_test.py --url https://staging.example.com --concurrency 1000
+```
 
 The suites cover registration and login flows, password recovery, downloads,
 reviews and reports, developer/app approvals, admin and co-admin permission

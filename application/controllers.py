@@ -3,7 +3,8 @@ import hashlib
 import re
 import secrets
 import smtplib
-import subprocess
+# ClamAV runs as a fixed argument list; shell execution is never enabled.
+import subprocess  # nosec B404
 import zipfile
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -31,6 +32,7 @@ from flask import (
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import joinedload, selectinload
+from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 from .database import db
@@ -49,6 +51,7 @@ from .models import (
     DownloadRecord,
     GovernmentIdType,
     LoginThrottle,
+    MarketplaceSettings,
     Notification,
     NotificationType,
     PasswordResetToken,
@@ -57,6 +60,7 @@ from .models import (
     ReleaseStatus,
     SecurityScanStatus,
     SavedApp,
+    SecurityQuestion,
     ReviewStatus,
     StoreApp,
     User,
@@ -66,6 +70,18 @@ from .realtime import account_events
 from .username_linked_list import username_index
 
 main = Blueprint("main", __name__)
+_DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(32))
+CLAMAV_SCAN_OPTIONS = (
+    "--no-summary",
+    "--infected",
+    "--scan-archive=yes",
+    "--detect-pua=yes",
+    "--detect-structured=yes",
+    "--heuristic-alerts=yes",
+    "--phishing-sigs=yes",
+    "--phishing-scan-urls=yes",
+    "--bytecode=yes",
+)
 
 
 def get_csrf_token():
@@ -84,7 +100,12 @@ def valid_csrf_token():
 
 def current_user():
     user_id = session.get("user_id")
-    return db.session.get(User, user_id) if user_id else None
+    user = db.session.get(User, user_id) if user_id else None
+    if user is not None and session.get("session_version") == user.session_version:
+        return user
+    if user_id:
+        session.clear()
+    return None
 
 
 def client_ip_address():
@@ -137,6 +158,7 @@ def sign_in_user(user, remember=False):
     session["user_id"] = user.id
     session["username"] = user.username
     session["role"] = user.role.value
+    session["session_version"] = user.session_version
     session["_csrf_token"] = secrets.token_urlsafe(32)
     session.permanent = remember
     user.last_login_at = datetime.now(timezone.utc)
@@ -222,6 +244,23 @@ def deliver_password_reset(user, reset_url):
             )
         smtp.send_message(message)
     return True
+
+
+def issue_password_reset(user):
+    now = datetime.now(timezone.utc)
+    PasswordResetToken.query.filter_by(user_id=user.id, used_at=None).update(
+        {"used_at": now}
+    )
+    raw_token = secrets.token_urlsafe(40)
+    db.session.add(
+        PasswordResetToken(
+            user_id=user.id,
+            token_hash=hashlib.sha256(raw_token.encode("utf-8")).hexdigest(),
+            expires_at=now + timedelta(minutes=30),
+        )
+    )
+    db.session.commit()
+    return raw_token
 
 
 def role_required(required_role):
@@ -409,7 +448,7 @@ def save_apk_upload(file_storage):
     if not original_name.lower().endswith(".apk"):
         raise ValueError("The application file must use the .apk extension.")
     size = upload_size(file_storage)
-    maximum_bytes = current_app.config["APK_MAX_BYTES"]
+    maximum_bytes = marketplace_settings().max_apk_size_mb * 1024 * 1024
     if size <= 0 or size > maximum_bytes:
         raise ValueError(
             f"APK must be smaller than {maximum_bytes // (1024 * 1024)} MB."
@@ -448,8 +487,8 @@ def scan_apk_for_malware(path):
     command = current_app.config["CLAMAV_COMMAND"]
     timeout = current_app.config["CLAMAV_TIMEOUT_SECONDS"]
     try:
-        result = subprocess.run(
-            [command, "--no-summary", "--infected", str(path)],
+        result = subprocess.run(  # nosec B603
+            [command, *CLAMAV_SCAN_OPTIONS, str(path)],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -472,12 +511,22 @@ def scan_apk_for_malware(path):
         ) from error
 
     if result.returncode == 0:
-        return "ClamAV malware scan passed · no threats detected"
+        return (
+            "ClamAV scan passed · archive, heuristic, ransomware/malware signature, "
+            "PUA, phishing, structured-data and bytecode checks found no threat"
+        )
     if result.returncode == 1:
+        signatures = []
+        for line in (result.stdout or "").splitlines():
+            if line.rstrip().endswith(" FOUND"):
+                signatures.append(
+                    line.rsplit(": ", 1)[-1].removesuffix(" FOUND")[:160]
+                )
         current_app.logger.warning(
             "ClamAV rejected an APK: %s", (result.stdout or "threat detected")[-1000:]
         )
-        raise ValueError("The APK was rejected because malware was detected.")
+        finding = ", ".join(dict.fromkeys(signatures)) or "malware signature"
+        raise ValueError(f"The APK was rejected: {finding} detected.")
     current_app.logger.error(
         "ClamAV scan error %s: %s",
         result.returncode,
@@ -557,6 +606,147 @@ def inspect_apk_archive(path):
     )
 
 
+def deep_scan_apk(path):
+    """Run 60 bounded static checks; warnings require human review, failures block."""
+    checks = []
+
+    def add(name, status, detail):
+        checks.append({"name": name, "status": status, "detail": detail})
+
+    with zipfile.ZipFile(path) as archive:
+        entries = archive.infolist()
+        names = [entry.filename for entry in entries]
+        lowered_names = [name.casefold() for name in names]
+        total_compressed = sum(entry.compress_size for entry in entries)
+        total_uncompressed = sum(entry.file_size for entry in entries)
+        ratio = total_uncompressed / max(total_compressed, 1)
+        unsafe_paths = [
+            name
+            for name in names
+            if not name
+            or "\\" in name
+            or name.startswith("/")
+            or ".." in PurePosixPath(name).parts
+        ]
+        add("Readable APK/ZIP container", "pass", f"{len(entries)} entries indexed")
+        add("Archive entry-count limit", "pass" if len(entries) <= 20000 else "fail", f"{len(entries):,} of 20,000 maximum")
+        add("Safe internal paths", "pass" if not unsafe_paths else "fail", "No traversal paths" if not unsafe_paths else f"{len(unsafe_paths)} unsafe paths")
+        encrypted = sum(bool(entry.flag_bits & 1) for entry in entries)
+        add("No encrypted archive entries", "pass" if not encrypted else "fail", f"{encrypted} encrypted entries")
+        add("Expanded-size limit", "pass" if total_uncompressed <= 1536 * 1024 * 1024 else "fail", f"{total_uncompressed / 1048576:.1f} MB expanded")
+        add("Compression-ratio limit", "pass" if ratio <= 200 or total_uncompressed <= 100 * 1024 * 1024 else "fail", f"{ratio:.1f}:1 ratio")
+        manifest_entries = [entry for entry in entries if entry.filename == "AndroidManifest.xml"]
+        add("Android manifest present", "pass" if manifest_entries else "fail", "AndroidManifest.xml found" if manifest_entries else "Missing manifest")
+        manifest_size = manifest_entries[0].file_size if manifest_entries else 0
+        add("Android manifest size", "pass" if 0 < manifest_size <= 20 * 1024 * 1024 else "fail", f"{manifest_size:,} bytes")
+        dex_count = sum(bool(re.fullmatch(r"classes\d*\.dex", name)) for name in lowered_names)
+        add("DEX application code present", "pass" if dex_count else "warning", f"{dex_count} DEX files")
+        signed = any(name.startswith("meta-inf/") and name.endswith((".rsa", ".dsa", ".ec")) for name in lowered_names)
+        add("Signing metadata present", "pass" if signed else "warning", "Certificate metadata found" if signed else "No v1 certificate metadata; verify modern APK signature externally")
+        duplicate_count = len(names) - len(set(names))
+        add("No duplicate archive names", "pass" if not duplicate_count else "fail", f"{duplicate_count} duplicate names")
+        symlinks = sum(((entry.external_attr >> 16) & 0o170000) == 0o120000 for entry in entries)
+        add("No symbolic links", "pass" if not symlinks else "fail", f"{symlinks} symbolic links")
+        desktop_exec = sum(name.endswith((".exe", ".dll", ".msi", ".bat", ".cmd", ".ps1")) for name in lowered_names)
+        add("No desktop executables/scripts", "pass" if not desktop_exec else "warning", f"{desktop_exec} matching files")
+        nested = sum(name.endswith((".zip", ".rar", ".7z", ".jar", ".apk")) for name in lowered_names)
+        add("No nested archives", "pass" if not nested else "warning", f"{nested} nested archives")
+        oversized = sum(entry.file_size > 512 * 1024 * 1024 for entry in entries)
+        add("No oversized internal file", "pass" if not oversized else "fail", f"{oversized} oversized entries")
+
+        sampled = bytearray()
+        for entry in entries:
+            if entry.is_dir() or len(sampled) >= 32 * 1024 * 1024:
+                continue
+            name = entry.filename.casefold()
+            if name == "androidmanifest.xml" or name.endswith((".dex", ".xml", ".json", ".js", ".txt", ".properties")):
+                with archive.open(entry) as source:
+                    sampled.extend(source.read(min(entry.file_size, 1024 * 1024)))
+        evidence = bytes(sampled).lower()
+
+    permission_checks = [
+        ("SMS sending permission", b"android.permission.send_sms"),
+        ("SMS reading permission", b"android.permission.read_sms"),
+        ("Call-log reading permission", b"android.permission.read_call_log"),
+        ("Call-log writing permission", b"android.permission.write_call_log"),
+        ("Direct phone-call permission", b"android.permission.call_phone"),
+        ("Contact reading permission", b"android.permission.read_contacts"),
+        ("Contact writing permission", b"android.permission.write_contacts"),
+        ("Precise-location permission", b"android.permission.access_fine_location"),
+        ("Background-location permission", b"android.permission.access_background_location"),
+        ("Microphone permission", b"android.permission.record_audio"),
+        ("Camera permission", b"android.permission.camera"),
+        ("Calendar reading permission", b"android.permission.read_calendar"),
+        ("Calendar writing permission", b"android.permission.write_calendar"),
+        ("Body-sensors permission", b"android.permission.body_sensors"),
+        ("Activity-recognition permission", b"android.permission.activity_recognition"),
+        ("External-storage read permission", b"android.permission.read_external_storage"),
+        ("External-storage write permission", b"android.permission.write_external_storage"),
+        ("All-files access permission", b"android.permission.manage_external_storage"),
+        ("Package installation permission", b"android.permission.request_install_packages"),
+        ("Package deletion permission", b"android.permission.delete_packages"),
+        ("Installed-app query permission", b"android.permission.query_all_packages"),
+        ("Accessibility-service binding", b"android.permission.bind_accessibility_service"),
+        ("Device-admin binding", b"android.permission.bind_device_admin"),
+        ("VPN-service binding", b"android.permission.bind_vpn_service"),
+        ("Notification-listener binding", b"android.permission.bind_notification_listener_service"),
+        ("Overlay-window permission", b"android.permission.system_alert_window"),
+        ("Usage-stats permission", b"android.permission.package_usage_stats"),
+        ("Boot-completed receiver", b"android.permission.receive_boot_completed"),
+        ("Wake-lock permission", b"android.permission.wake_lock"),
+        ("Biometric permission", b"android.permission.use_biometric"),
+    ]
+    for name, marker in permission_checks:
+        found = marker in evidence
+        add(name, "warning" if found else "pass", "Declared; verify it is essential" if found else "Not detected")
+
+    behavior_checks = [
+        ("Cleartext HTTP endpoints", b"http://"),
+        ("Localhost endpoints", b"localhost"),
+        ("Loopback IP endpoints", b"127.0.0.1"),
+        ("Embedded private key", b"begin private key"),
+        ("AWS access-key pattern", b"akia"),
+        ("Firebase database endpoint", b"firebaseio.com"),
+        ("Root-shell path", b"/system/bin/su"),
+        ("Dynamic DEX loading", b"dexclassloader"),
+        ("Native library loading", b"loadlibrary"),
+        ("WebView JavaScript bridge", b"addjavascriptinterface"),
+        ("WebView JavaScript enabling", b"setjavascriptenabled"),
+        ("Runtime command execution", b"runtime;->exec"),
+        ("ProcessBuilder execution", b"processbuilder"),
+        ("Cryptomining indicators", b"stratum+tcp"),
+        ("Debug/test-only build flags", b"android:testonly"),
+    ]
+    for name, marker in behavior_checks:
+        found = marker in evidence
+        add(name, "warning" if found else "pass", "Indicator detected; inspect before approval" if found else "Not detected")
+
+    counts = {status: sum(check["status"] == status for check in checks) for status in ("pass", "warning", "fail")}
+    return {
+        "version": 1,
+        "total": len(checks),
+        "passed": counts["pass"],
+        "warnings": counts["warning"],
+        "failed": counts["fail"],
+        "sampled_bytes": len(evidence),
+        "checks": checks,
+        "disclaimer": "Static indicators are not proof of safety or correctness; review warnings and test the app in an isolated environment.",
+    }
+
+
+def parse_deep_scan_report(summary):
+    try:
+        report = json.loads(summary or "")
+    except (TypeError, ValueError):
+        return None
+    return report if isinstance(report, dict) and report.get("version") == 1 else None
+
+
+def deep_scan_passed(summary):
+    report = parse_deep_scan_report(summary)
+    return bool(report and report.get("total") == 60 and report.get("failed") == 0)
+
+
 def duplicate_apk_exists(digest, exclude_app_id=None, allow_pending_app_id=None):
     current_query = StoreApp.query.filter(StoreApp.apk_sha256 == digest)
     if exclude_app_id is not None:
@@ -588,12 +778,30 @@ def is_valid_web_url(value, required=False):
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
+def escaped_search_term(value, maximum_length=100):
+    """Bound LIKE searches and treat SQL wildcard characters as plain text."""
+    value = value.strip()[:maximum_length].casefold()
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def unique_app_slug(name):
     base = re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-") or "app"
     slug = base
     while StoreApp.query.filter_by(slug=slug).first():
         slug = f"{base}-{secrets.token_hex(3)}"
     return slug
+
+
+def marketplace_settings():
+    return db.session.get(MarketplaceSettings, 1)
+
+
+def developer_app_limit(user):
+    return (
+        user.app_upload_limit
+        if user.app_upload_limit is not None
+        else marketplace_settings().default_app_limit
+    )
 
 
 def send_private_upload(
@@ -626,6 +834,11 @@ def validate_registration(form, role):
     password = form.get("password", "")
     confirm_password = form.get("confirm_password", "")
     company_name = form.get("company_name", "").strip()
+    security_answer = form.get("security_answer", "").strip()
+    try:
+        security_question = SecurityQuestion(form.get("security_question", ""))
+    except ValueError:
+        security_question = None
     errors = []
 
     if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", username):
@@ -635,17 +848,21 @@ def validate_registration(form, role):
     if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
         errors.append("Enter a valid email address.")
     if (
-        len(password) < 8
+        len(password) < 12
         or not re.search(r"[A-Za-z]", password)
         or not re.search(r"\d", password)
     ):
         errors.append(
-            "Password must be at least 8 characters and include a letter and a number."
+            "Password must be at least 12 characters and include a letter and a number."
         )
     if password != confirm_password:
         errors.append("Passwords do not match.")
     if role == UserRole.DEVELOPER and len(company_name) < 2:
         errors.append("Enter your developer or studio name.")
+    if security_question is None:
+        errors.append("Choose a security question.")
+    if not 4 <= len(security_answer) <= 200:
+        errors.append("Security answer must contain 4–200 characters.")
 
     username_exists = username_index.contains(username)
     email_exists = User.query.filter(func.lower(User.email) == email).first()
@@ -659,6 +876,8 @@ def validate_registration(form, role):
         "email": email,
         "password": password,
         "company_name": company_name or None,
+        "security_question": security_question,
+        "security_answer": security_answer,
     }
 
 
@@ -708,6 +927,16 @@ def data_retention_policy():
     return render_template("data_retention_policy.html")
 
 
+@main.route("/grievance")
+def grievance_policy():
+    return render_template("grievance_policy.html")
+
+
+@main.route("/security-and-legal")
+def security_legal_policy():
+    return render_template("security_legal_policy.html")
+
+
 @main.route("/forgot-password", methods=["GET", "POST"])
 def forgot_password():
     requested_role = request.form.get("role") or request.args.get(
@@ -715,7 +944,6 @@ def forgot_password():
     )
     if requested_role not in {UserRole.USER.value, UserRole.DEVELOPER.value}:
         requested_role = UserRole.USER.value
-    development_reset_url = None
     request_sent = False
     if request.method == "POST":
         if not valid_csrf_token():
@@ -730,24 +958,11 @@ def forgot_password():
                 record_login_failure("password-reset", email)
                 user = User.query.filter(
                     func.lower(User.email) == email,
+                    User.role == UserRole(requested_role),
                     User.status != AccountStatus.BLOCKED,
                 ).first()
                 if user:
-                    now = datetime.now(timezone.utc)
-                    PasswordResetToken.query.filter_by(
-                        user_id=user.id,
-                        used_at=None,
-                    ).update({"used_at": now})
-                    raw_token = secrets.token_urlsafe(40)
-                    reset_record = PasswordResetToken(
-                        user_id=user.id,
-                        token_hash=hashlib.sha256(
-                            raw_token.encode("utf-8")
-                        ).hexdigest(),
-                        expires_at=now + timedelta(minutes=30),
-                    )
-                    db.session.add(reset_record)
-                    db.session.commit()
+                    raw_token = issue_password_reset(user)
                     reset_url = current_app.config["PUBLIC_BASE_URL"] + url_for(
                         "main.reset_password", token=raw_token
                     )
@@ -755,22 +970,66 @@ def forgot_password():
                         delivered = deliver_password_reset(user, reset_url)
                     except (OSError, smtplib.SMTPException):
                         delivered = False
-                    if (
-                        current_app.debug
-                        and not delivered
-                        and current_app.config["PUBLIC_BASE_URL"].startswith(
-                            ("http://127.0.0.1", "http://localhost")
-                        )
-                    ):
-                        development_reset_url = reset_url
             request_sent = True
 
     return render_template(
         "password_recovery.html",
         mode="request",
         request_sent=request_sent,
-        development_reset_url=development_reset_url,
         recovery_role=requested_role,
+        csrf_token=get_csrf_token(),
+    )
+
+
+@main.route("/forgot-password/security-question", methods=["GET", "POST"])
+def security_question_recovery():
+    role_value = request.form.get("role") or request.args.get(
+        "role", UserRole.USER.value
+    )
+    if role_value not in {UserRole.USER.value, UserRole.DEVELOPER.value}:
+        role_value = UserRole.USER.value
+    if request.method == "POST":
+        if not valid_csrf_token():
+            abort(400)
+        identifier = request.form.get("identifier", "").strip().casefold()
+        answer = request.form.get("security_answer", "")
+        try:
+            question = SecurityQuestion(request.form.get("security_question", ""))
+        except ValueError:
+            question = None
+        scope = f"security-recovery-{role_value}"
+        if identifier and not login_is_throttled(scope, identifier):
+            user = User.query.filter(
+                User.role == UserRole(role_value),
+                User.status.notin_([AccountStatus.BLOCKED, AccountStatus.DELETED]),
+                or_(
+                    func.lower(User.username) == identifier,
+                    func.lower(User.email) == identifier,
+                ),
+            ).first()
+            answer_matches = (
+                user.check_security_answer(answer)
+                if user
+                else check_password_hash(
+                    _DUMMY_PASSWORD_HASH, " ".join(answer.casefold().split())
+                )
+            )
+            if (
+                user
+                and question is not None
+                and user.security_question == question
+                and answer_matches
+            ):
+                clear_login_failures(scope, identifier)
+                token = issue_password_reset(user)
+                return redirect(url_for("main.reset_password", token=token))
+            record_login_failure(scope, identifier)
+        flash("Those recovery details could not be verified.", "error")
+    return render_template(
+        "password_recovery.html",
+        mode="security_question",
+        recovery_role=role_value,
+        security_questions=SecurityQuestion,
         csrf_token=get_csrf_token(),
     )
 
@@ -793,12 +1052,12 @@ def reset_password(token):
         password = request.form.get("password", "")
         confirmation = request.form.get("confirm_password", "")
         if (
-            len(password) < 8
+            len(password) < 12
             or not re.search(r"[A-Za-z]", password)
             or not re.search(r"\d", password)
         ):
             flash(
-                "Password must be at least 8 characters and include a letter and a number.",
+                "Password must be at least 12 characters and include a letter and a number.",
                 "error",
             )
         elif password != confirmation:
@@ -866,10 +1125,16 @@ def admin_login():
             ),
         ).first()
 
+        password_matches = (
+            admin.check_password(password)
+            if admin
+            else check_password_hash(_DUMMY_PASSWORD_HASH, password)
+        )
+
         if (
             admin
             and admin.status == AccountStatus.APPROVED
-            and admin.check_password(password)
+            and password_matches
         ):
             clear_login_failures("admin-login", identifier)
             sign_in_user(admin, request.form.get("remember") == "on")
@@ -923,7 +1188,13 @@ def account_login(role_name):
             ),
         ).first()
 
-        if not user or not user.check_password(password):
+        password_matches = (
+            user.check_password(password)
+            if user
+            else check_password_hash(_DUMMY_PASSWORD_HASH, password)
+        )
+
+        if not user or not password_matches:
             record_login_failure(f"{role.value}-login", identifier)
             flash("Incorrect email, username, or password.", "error")
         elif user.status == AccountStatus.BLOCKED:
@@ -975,6 +1246,7 @@ def create_account(role_name):
         "username": request.form.get("username", ""),
         "email": request.form.get("email", ""),
         "company_name": request.form.get("company_name", ""),
+        "security_question": request.form.get("security_question", ""),
     }
 
     if request.method == "POST":
@@ -987,6 +1259,8 @@ def create_account(role_name):
             errors.append(
                 "You must accept the Terms, Privacy Policy, and Acceptable Use Policy."
             )
+        if request.form.get("confirm_adult") != "yes":
+            errors.append("You must confirm that you are at least 18 years old.")
         if errors:
             for error in errors:
                 flash(error, "error")
@@ -1004,8 +1278,10 @@ def create_account(role_name):
                 status=status,
                 terms_accepted_at=datetime.now(timezone.utc),
                 terms_version=current_app.config["POLICY_VERSION"],
+                security_question=values["security_question"],
             )
             account.set_password(values["password"])
+            account.set_security_answer(values["security_answer"])
             if status == AccountStatus.APPROVED:
                 account.approve()
             db.session.add(account)
@@ -1021,6 +1297,7 @@ def create_account(role_name):
                     "register.html",
                     account_role=role,
                     form_values=form_values,
+                    security_questions=SecurityQuestion,
                     csrf_token=get_csrf_token(),
                 )
 
@@ -1044,6 +1321,7 @@ def create_account(role_name):
         "register.html",
         account_role=role,
         form_values=form_values,
+        security_questions=SecurityQuestion,
         csrf_token=get_csrf_token(),
     )
 
@@ -1160,6 +1438,16 @@ def submit_app(user, app_id=None):
     if not user.developer_profile or not user.developer_profile.is_submitted:
         flash("Complete developer verification before uploading an app.", "error")
         return redirect(url_for("main.developer_verification"))
+    if app_id is None:
+        app_count = StoreApp.query.filter_by(developer_id=user.id).count()
+        app_limit = developer_app_limit(user)
+        if app_count >= app_limit:
+            flash(
+                f"Your current plan allows {app_limit} app"
+                f"{'s' if app_limit != 1 else ''}. Contact an administrator for more slots.",
+                "warning",
+            )
+            return redirect(url_for("main.developer_dashboard"))
 
     app_record = None
     if app_id is not None:
@@ -1613,19 +1901,19 @@ def submit_app_version(user, app_id):
 def app_marketplace():
     page = request.args.get("page", 1, type=int)
     category_value = request.args.get("category", "all")
-    query_text = request.args.get("q", "").strip()
+    query_text = request.args.get("q", "").strip()[:100]
     apps_query = StoreApp.query.options(joinedload(StoreApp.developer)).filter_by(
         status=AppStatus.APPROVED
     )
     if category_value in {category.value for category in AppCategory}:
         apps_query = apps_query.filter(StoreApp.category == AppCategory(category_value))
     if query_text:
-        search = f"%{query_text.lower()}%"
+        search = f"%{escaped_search_term(query_text)}%"
         apps_query = apps_query.filter(
             or_(
-                func.lower(StoreApp.name).like(search),
-                func.lower(StoreApp.short_description).like(search),
-                func.lower(StoreApp.description).like(search),
+                func.lower(StoreApp.name).like(search, escape="\\"),
+                func.lower(StoreApp.short_description).like(search, escape="\\"),
+                func.lower(StoreApp.description).like(search, escape="\\"),
             )
         )
     pagination = apps_query.order_by(
@@ -1883,7 +2171,7 @@ def app_screenshot(screenshot_id):
 @staff_required
 def admin_dashboard(admin):
     page = request.args.get("page", 1, type=int)
-    query_text = request.args.get("q", "").strip()
+    query_text = request.args.get("q", "").strip()[:100]
     role_filter = request.args.get("role", "all")
     status_filter = request.args.get("status", "all")
 
@@ -1894,12 +2182,14 @@ def admin_dashboard(admin):
     if admin.role == UserRole.CO_ADMIN:
         accounts_query = accounts_query.filter(User.role == UserRole.DEVELOPER)
     if query_text:
-        search = f"%{query_text.lower()}%"
+        search = f"%{escaped_search_term(query_text)}%"
         accounts_query = accounts_query.filter(
             or_(
-                func.lower(User.username).like(search),
-                func.lower(User.email).like(search),
-                func.lower(func.coalesce(User.company_name, "")).like(search),
+                func.lower(User.username).like(search, escape="\\"),
+                func.lower(User.email).like(search, escape="\\"),
+                func.lower(func.coalesce(User.company_name, "")).like(
+                    search, escape="\\"
+                ),
             )
         )
     if role_filter in {UserRole.USER.value, UserRole.DEVELOPER.value}:
@@ -1958,6 +2248,7 @@ def admin_developer_review(admin, user_id):
         admin=admin,
         developer=developer,
         profile=developer.developer_profile,
+        marketplace_settings=marketplace_settings(),
         csrf_token=get_csrf_token(),
     )
 
@@ -2146,9 +2437,37 @@ def admin_trash(admin):
 @main.route("/admin/settings", methods=["GET", "POST"])
 @staff_required
 def admin_settings(admin):
+    settings = marketplace_settings()
     if request.method == "POST":
         if not valid_csrf_token():
             abort(400)
+        if request.form.get("settings_section") == "marketplace":
+            if admin.role != UserRole.ADMIN:
+                abort(403)
+            try:
+                default_app_limit = int(request.form.get("default_app_limit", ""))
+                max_apk_size_mb = int(request.form.get("max_apk_size_mb", ""))
+            except ValueError:
+                default_app_limit = max_apk_size_mb = -1
+            if not 0 <= default_app_limit <= 1000:
+                flash("Default app limit must be between 0 and 1,000.", "error")
+            elif not 10 <= max_apk_size_mb <= 200:
+                flash("Maximum APK size must be between 10 and 200 MB.", "error")
+            else:
+                settings.default_app_limit = default_app_limit
+                settings.max_apk_size_mb = max_apk_size_mb
+                record_admin_audit(
+                    admin,
+                    AuditAction.ACCOUNT_MODERATION,
+                    "update_marketplace_limits",
+                    "marketplace",
+                    settings.id,
+                    "Upload defaults",
+                    f"{default_app_limit} apps, {max_apk_size_mb} MB",
+                )
+                db.session.commit()
+                flash("Marketplace upload defaults were updated.", "success")
+            return redirect(url_for("main.admin_settings"))
         email = request.form.get("email", "").strip().lower()
         current_password = request.form.get("current_password", "")
         new_password = request.form.get("new_password", "")
@@ -2197,14 +2516,51 @@ def admin_settings(admin):
             )
             try:
                 db.session.commit()
+                if new_password:
+                    session["session_version"] = admin.session_version
                 flash("Administrator settings were updated securely.", "success")
                 return redirect(url_for("main.admin_settings"))
             except IntegrityError:
                 db.session.rollback()
                 flash("That email address is already in use.", "error")
     return render_template(
-        "admin_settings.html", admin=admin, csrf_token=get_csrf_token()
+        "admin_settings.html",
+        admin=admin,
+        marketplace_settings=settings,
+        csrf_token=get_csrf_token(),
     )
+
+
+@main.post("/admin/developers/<int:user_id>/upload-limit")
+@role_required(UserRole.ADMIN)
+def set_developer_upload_limit(admin, user_id):
+    if not valid_csrf_token():
+        abort(400)
+    developer = db.session.get(User, user_id)
+    if developer is None or developer.role != UserRole.DEVELOPER:
+        abort(404)
+    raw_limit = request.form.get("app_upload_limit", "").strip()
+    try:
+        limit = None if raw_limit == "" else int(raw_limit)
+    except ValueError:
+        limit = -1
+    if limit is not None and not 0 <= limit <= 1000:
+        flash("Developer app limit must be between 0 and 1,000.", "error")
+    else:
+        developer.app_upload_limit = limit
+        label = "default" if limit is None else str(limit)
+        record_admin_audit(
+            admin,
+            AuditAction.ACCOUNT_MODERATION,
+            "update_upload_limit",
+            "developer",
+            developer.id,
+            developer.username,
+            f"App limit: {label}",
+        )
+        db.session.commit()
+        flash(f"Upload limit for {developer.username} was updated.", "success")
+    return redirect(url_for("main.admin_developer_review", user_id=user_id))
 
 
 @main.post("/admin/co-admins/<int:user_id>/toggle")
@@ -2290,7 +2646,7 @@ def manage_review(admin, review_id, action):
 def admin_apps(admin):
     page = request.args.get("page", 1, type=int)
     status_value = request.args.get("status", "all")
-    query_text = request.args.get("q", "").strip()
+    query_text = request.args.get("q", "").strip()[:100]
     apps_query = StoreApp.query.options(joinedload(StoreApp.developer)).filter(
         StoreApp.status != AppStatus.DELETED
     )
@@ -2304,12 +2660,12 @@ def admin_apps(admin):
     elif status_value in {status.value for status in AppStatus}:
         apps_query = apps_query.filter(StoreApp.status == AppStatus(status_value))
     if query_text:
-        search = f"%{query_text.lower()}%"
+        search = f"%{escaped_search_term(query_text)}%"
         apps_query = apps_query.join(User).filter(
             or_(
-                func.lower(StoreApp.name).like(search),
-                func.lower(StoreApp.package_name).like(search),
-                func.lower(User.username).like(search),
+                func.lower(StoreApp.name).like(search, escape="\\"),
+                func.lower(StoreApp.package_name).like(search, escape="\\"),
+                func.lower(User.username).like(search, escape="\\"),
             )
         )
     pagination = apps_query.order_by(
@@ -2353,8 +2709,154 @@ def admin_app_review(admin, app_id):
         "admin_app_review.html",
         admin=admin,
         app_record=app_record,
+        deep_scan_report=parse_deep_scan_report(app_record.security_scan_summary),
+        pending_deep_scan_report=parse_deep_scan_report(
+            app_record.pending_security_scan_summary
+        ),
         csrf_token=get_csrf_token(),
     )
+
+
+@main.post("/admin/apps/<int:app_id>/scan")
+@staff_required
+def scan_app(admin, app_id):
+    if not valid_csrf_token():
+        abort(400)
+    app_record = db.session.get(StoreApp, app_id)
+    if app_record is None:
+        abort(404)
+    target_name = request.form.get("target", "current")
+    if target_name not in {"current", "pending"}:
+        abort(400)
+    pending = target_name == "pending"
+    filename = app_record.pending_apk_file if pending else app_record.apk_file
+    if not filename or Path(filename).name != filename:
+        abort(404)
+    directory = private_upload_folder("apks")
+    path = (directory / filename).resolve()
+    if path.parent != directory or not path.is_file():
+        abort(404)
+
+    now = datetime.now(timezone.utc)
+    try:
+        report = deep_scan_apk(path)
+        structural_status = (
+            SecurityScanStatus.PASSED
+            if report["failed"] == 0
+            else SecurityScanStatus.FAILED
+        )
+        structural_summary = json.dumps(report, separators=(",", ":"))
+    except (OSError, ValueError, zipfile.BadZipFile) as error:
+        structural_status = SecurityScanStatus.FAILED
+        structural_summary = str(error) or "The APK could not be statically analyzed."
+
+    try:
+        malware_summary = scan_apk_for_malware(path)
+        malware_status = SecurityScanStatus.PASSED
+    except ValueError as error:
+        malware_summary = str(error)
+        malware_status = SecurityScanStatus.FAILED
+
+    prefix = "pending_" if pending else ""
+    setattr(app_record, f"{prefix}security_scan_status", structural_status)
+    setattr(app_record, f"{prefix}security_scan_summary", structural_summary)
+    setattr(app_record, f"{prefix}security_scanned_at", now)
+    setattr(app_record, f"{prefix}malware_scan_status", malware_status)
+    setattr(app_record, f"{prefix}malware_scan_summary", malware_summary)
+    setattr(app_record, f"{prefix}malware_scanned_at", now)
+    record_admin_audit(
+        admin,
+        AuditAction.APP_MODERATION,
+        "security_scan",
+        "release" if pending else "app",
+        app_record.id,
+        app_record.name,
+        f"{target_name}: static={structural_status.value}, malware={malware_status.value}",
+    )
+    db.session.commit()
+    if structural_status == SecurityScanStatus.PASSED and malware_status == SecurityScanStatus.PASSED:
+        flash("Security scan completed. Review any warnings before approval.", "success")
+    else:
+        flash("Security scan found a failure. This build cannot be approved.", "error")
+    return redirect(url_for("main.admin_app_review", app_id=app_id))
+
+
+@main.get("/admin/apps/<int:app_id>/scan-report")
+@staff_required
+def download_scan_report(admin, app_id):
+    app_record = db.session.get(StoreApp, app_id)
+    if app_record is None:
+        abort(404)
+    target_name = request.args.get("target", "current")
+    if target_name not in {"current", "pending"}:
+        abort(400)
+    pending = target_name == "pending"
+    prefix = "pending_" if pending else ""
+    static_summary = getattr(app_record, f"{prefix}security_scan_summary")
+    static_report = parse_deep_scan_report(static_summary)
+    if static_report is None:
+        abort(404)
+    static_status = getattr(app_record, f"{prefix}security_scan_status")
+    malware_status = getattr(app_record, f"{prefix}malware_scan_status")
+    scanned_at = getattr(app_record, f"{prefix}security_scanned_at")
+    malware_scanned_at = getattr(app_record, f"{prefix}malware_scanned_at")
+    report = {
+        "report_format": "appora-apk-security-report-v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "app": {
+            "id": app_record.id,
+            "name": app_record.name,
+            "package_name": app_record.package_name,
+            "developer": app_record.developer.username,
+            "target": target_name,
+            "version": app_record.pending_version if pending else app_record.version,
+            "file_name": app_record.pending_apk_original_name if pending else app_record.apk_original_name,
+            "size_bytes": app_record.pending_apk_size if pending else app_record.apk_size,
+            "sha256": app_record.pending_apk_sha256 if pending else app_record.apk_sha256,
+        },
+        "verdict": (
+            "blocked"
+            if static_status != SecurityScanStatus.PASSED
+            or malware_status != SecurityScanStatus.PASSED
+            else "review_warnings"
+            if static_report["warnings"]
+            else "eligible_for_approval"
+        ),
+        "static_analysis": {
+            "status": static_status.value if static_status else "unscanned",
+            "scanned_at": scanned_at.isoformat() if scanned_at else None,
+            **static_report,
+        },
+        "malware_analysis": {
+            "engine": "ClamAV",
+            "status": malware_status.value if malware_status else "unscanned",
+            "scanned_at": malware_scanned_at.isoformat() if malware_scanned_at else None,
+            "result": getattr(app_record, f"{prefix}malware_scan_summary"),
+            "coverage": [
+                "known malware and ransomware signatures",
+                "potentially unwanted applications",
+                "archive-contained payloads",
+                "heuristic indicators",
+                "phishing URLs",
+                "structured sensitive data",
+                "ClamAV bytecode rules",
+            ],
+        },
+        "limitations": [
+            "A clean result is not a guarantee that the APK is safe or bug-free.",
+            "Unknown zero-day threats and behavior visible only at runtime may not be detected.",
+            "Warnings require administrator review and isolated runtime testing.",
+        ],
+    }
+    response = Response(
+        json.dumps(report, indent=2),
+        mimetype="application/json",
+    )
+    response.headers["Content-Disposition"] = (
+        f'attachment; filename="appora-scan-{app_record.id}-{target_name}.json"'
+    )
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
 
 
 @main.get("/admin/apps/<int:app_id>/apk")
@@ -2402,9 +2904,9 @@ def manage_app_release(admin, app_id, action):
         if app_record.pending_release_status != ReleaseStatus.PENDING:
             flash("Only a pending version can be approved.", "error")
             return redirect(url_for("main.admin_app_review", app_id=app_id))
-        if app_record.pending_security_scan_status != SecurityScanStatus.PASSED:
+        if not deep_scan_passed(app_record.pending_security_scan_summary):
             flash(
-                "This version must pass structural safety checks before approval.",
+                "Run the 60-point administrator security scan before approval.",
                 "error",
             )
             return redirect(url_for("main.admin_app_review", app_id=app_id))
@@ -2524,9 +3026,9 @@ def manage_app(admin, app_id, action):
         return redirect(url_for("main.admin_app_review", app_id=app_id))
     if (
         action == "approve"
-        and app_record.security_scan_status != SecurityScanStatus.PASSED
+        and not deep_scan_passed(app_record.security_scan_summary)
     ):
-        flash("This APK must pass structural safety checks before approval.", "error")
+        flash("Run the 60-point administrator security scan before approval.", "error")
         return redirect(url_for("main.admin_app_review", app_id=app_id))
     if (
         action == "approve"
@@ -2914,6 +3416,16 @@ def account_settings():
         current_password = request.form.get("current_password", "")
         new_password = request.form.get("new_password", "")
         confirm_password = request.form.get("confirm_password", "")
+        security_answer = request.form.get("security_answer", "").strip()
+        question_value = request.form.get("security_question")
+        try:
+            security_question = (
+                SecurityQuestion(question_value)
+                if question_value is not None
+                else user.security_question
+            )
+        except ValueError:
+            security_question = None
         errors = []
         if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
             errors.append("Enter a valid email address.")
@@ -2923,13 +3435,29 @@ def account_settings():
             errors.append("That email address is already in use.")
         if user.role == UserRole.DEVELOPER and not company_name:
             errors.append("Enter your developer or company name.")
-        if new_password or confirm_password or current_password:
+        if new_password or confirm_password:
             if not user.check_password(current_password):
                 errors.append("Your current password is incorrect.")
-            elif len(new_password) < 8:
-                errors.append("The new password must contain at least 8 characters.")
+            elif (
+                len(new_password) < 12
+                or not re.search(r"[A-Za-z]", new_password)
+                or not re.search(r"\d", new_password)
+            ):
+                errors.append(
+                    "The new password must be at least 12 characters with a letter and number."
+                )
             elif new_password != confirm_password:
                 errors.append("The new passwords do not match.")
+        security_change = security_answer or security_question != user.security_question
+        if security_change:
+            if not user.check_password(current_password):
+                errors.append(
+                    "Enter your current password to change the security question."
+                )
+            elif security_question is None:
+                errors.append("Choose a security question.")
+            elif not 4 <= len(security_answer) <= 200:
+                errors.append("Security answer must contain 4–200 characters.")
         if errors:
             for error in errors:
                 flash(error, "error")
@@ -2939,8 +3467,13 @@ def account_settings():
                 user.company_name = company_name
             if new_password:
                 user.set_password(new_password)
+            if security_change:
+                user.security_question = security_question
+                user.set_security_answer(security_answer)
             try:
                 db.session.commit()
+                if new_password:
+                    session["session_version"] = user.session_version
                 flash("Your account settings were updated.", "success")
                 return redirect(url_for("main.account_settings"))
             except IntegrityError:
@@ -2950,6 +3483,7 @@ def account_settings():
     return render_template(
         "account_settings.html",
         user=user,
+        security_questions=SecurityQuestion,
         csrf_token=get_csrf_token(),
     )
 
@@ -3095,6 +3629,8 @@ def developer_dashboard(user):
         seven_day_downloads=seven_day_downloads,
         max_daily_downloads=max_daily_downloads,
         csrf_token=get_csrf_token(),
+        app_limit=developer_app_limit(user),
+        max_apk_size_mb=marketplace_settings().max_apk_size_mb,
     )
 
 

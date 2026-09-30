@@ -28,6 +28,22 @@ class GovernmentIdType(str, Enum):
     VOTER_ID = "voter_id"
 
 
+class SecurityQuestion(str, Enum):
+    MEMORABLE_PLACE = "memorable_place"
+    CHILDHOOD_NICKNAME = "childhood_nickname"
+    FIRST_TEACHER = "first_teacher"
+    PRIVATE_PHRASE = "private_phrase"
+
+    @property
+    def label(self):
+        return {
+            self.MEMORABLE_PLACE: "What place is personally memorable to you?",
+            self.CHILDHOOD_NICKNAME: "What childhood nickname do you remember?",
+            self.FIRST_TEACHER: "What was the first name of a teacher you remember?",
+            self.PRIVATE_PHRASE: "What private recovery phrase did you choose?",
+        }[self]
+
+
 class AppCategory(str, Enum):
     BUSINESS = "business"
     EDUCATION = "education"
@@ -125,6 +141,19 @@ class User(db.Model):
     username = db.Column(db.String(80), unique=True, nullable=False, index=True)
     email = db.Column(db.String(120), unique=True, nullable=False, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
+    session_version = db.Column(db.Integer, nullable=False, default=0)
+    security_question = db.Column(
+        db.Enum(
+            SecurityQuestion,
+            values_callable=enum_values,
+            native_enum=False,
+            validate_strings=True,
+            length=30,
+        ),
+        nullable=True,
+    )
+    security_answer_hash = db.Column(db.String(255), nullable=True)
+    app_upload_limit = db.Column(db.Integer, nullable=True)
     role = db.Column(
         db.Enum(
             UserRole,
@@ -191,9 +220,20 @@ class User(db.Model):
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
+        self.session_version = (self.session_version or 0) + 1
 
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
+
+    def set_security_answer(self, answer):
+        normalized = " ".join(answer.casefold().split())
+        self.security_answer_hash = generate_password_hash(normalized)
+
+    def check_security_answer(self, answer):
+        normalized = " ".join(answer.casefold().split())
+        return bool(self.security_answer_hash) and check_password_hash(
+            self.security_answer_hash, normalized
+        )
 
     @property
     def role_label(self):
@@ -557,6 +597,20 @@ class StoreApp(db.Model):
         self.pending_release_status = None
         self.pending_release_note = None
         self.pending_release_submitted_at = None
+
+
+class MarketplaceSettings(db.Model):
+    __tablename__ = "marketplace_settings"
+
+    id = db.Column(db.Integer, primary_key=True, default=1)
+    default_app_limit = db.Column(db.Integer, nullable=False, default=2)
+    max_apk_size_mb = db.Column(db.Integer, nullable=False, default=200)
+    updated_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
 
 
 class AppVersionHistory(db.Model):

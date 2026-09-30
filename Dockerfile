@@ -14,4 +14,4 @@ RUN mkdir -p /data/appora/uploads && chown -R 10001:10001 /app /data/appora
 
 USER 10001:10001
 EXPOSE 8000
-CMD ["gunicorn", "--workers", "3", "--worker-class", "gthread", "--threads", "2", "--keep-alive", "5", "--timeout", "300", "--bind", "0.0.0.0:8000", "--access-logfile", "-", "--error-logfile", "-", "app:app"]
+CMD ["gunicorn", "--workers", "4", "--worker-class", "gevent", "--worker-connections", "1200", "--keep-alive", "5", "--timeout", "300", "--bind", "0.0.0.0:8000", "--access-logfile", "-", "--error-logfile", "-", "app:app"]

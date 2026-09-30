@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 import os
 import re
+import json
 import shutil
 import tempfile
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ os.environ["ADMIN_PASSWORD"] = "AdminPass123!"
 os.environ["AUTO_MIGRATE"] = "true"
 
 from app import app
+from application.controllers import issue_password_reset
 from application.database import db
 from application.models import (
     AccountStatus,
@@ -27,10 +29,12 @@ from application.models import (
     AuditLog,
     DeveloperProfile,
     GovernmentIdType,
+    MarketplaceSettings,
     DownloadRecord,
     PasswordResetToken,
     ReportStatus,
     SavedApp,
+    SecurityQuestion,
     SecurityScanStatus,
     StoreApp,
     User,
@@ -58,6 +62,8 @@ try:
         "/acceptable-use",
         "/copyright",
         "/data-retention",
+        "/grievance",
+        "/security-and-legal",
     ):
         assert app.test_client().get(policy_path).status_code == 200
     registration_client = app.test_client()
@@ -68,12 +74,19 @@ try:
         "email": "policy-user@example.com",
         "password": "PolicyPass123!",
         "confirm_password": "PolicyPass123!",
+        "security_question": "private_phrase",
+        "security_answer": "Policy recovery phrase",
     }
     rejected_terms = registration_client.post(
         "/register/user", data=registration_data, follow_redirects=True
     )
     assert b"must accept the Terms" in rejected_terms.data
     registration_data["accept_terms"] = "yes"
+    rejected_age = registration_client.post(
+        "/register/user", data=registration_data, follow_redirects=True
+    )
+    assert b"at least 18 years old" in rejected_age.data
+    registration_data["confirm_adult"] = "yes"
     accepted_terms = registration_client.post("/register/user", data=registration_data)
     assert (
         accepted_terms.status_code == 200 and b"Account created" in accepted_terms.data
@@ -107,6 +120,11 @@ try:
     )
     assert admin_dashboard.status_code == 200
     assert admin_dashboard.request.path == "/admin"
+    script_policy = admin_dashboard.headers["Content-Security-Policy"].split(
+        "script-src", 1
+    )[1].split(";", 1)[0]
+    assert "'unsafe-inline'" not in script_policy
+    assert b'<script nonce="' in admin_dashboard.data
     (uploads / "app_icons").mkdir(parents=True, exist_ok=True)
     (uploads / "apks").mkdir(parents=True, exist_ok=True)
     (uploads / "app_icons" / "icon.png").write_bytes(b"icon")
@@ -119,6 +137,8 @@ try:
             status=AccountStatus.APPROVED,
         )
         user.set_password("UserPass123!")
+        user.security_question = SecurityQuestion.PRIVATE_PHRASE
+        user.set_security_answer("Blue Lantern 42")
         user.approve()
         developer = User(
             username="market_dev",
@@ -129,6 +149,16 @@ try:
         )
         developer.set_password("DevPass123!")
         developer.approve()
+        developer.developer_profile = DeveloperProfile(
+            legal_name="Market Developer",
+            phone="+91 9000000000",
+            country="India",
+            government_id_type=GovernmentIdType.PASSPORT,
+            government_id_number="MARKET123",
+            government_id_file="market-id.png",
+            government_id_original_name="market-id.png",
+            submitted_at=datetime.now(timezone.utc),
+        )
         db.session.add_all([user, developer])
         pending_developer = User(
             username="pending_dev",
@@ -169,6 +199,18 @@ try:
             apk_size=3,
             apk_sha256="a" * 64,
             security_scan_status=SecurityScanStatus.PASSED,
+            security_scan_summary=json.dumps(
+                {
+                    "version": 1,
+                    "total": 60,
+                    "passed": 60,
+                    "warnings": 0,
+                    "failed": 0,
+                    "sampled_bytes": 3,
+                    "checks": [],
+                    "disclaimer": "Workflow fixture",
+                }
+            ),
             malware_scan_status=SecurityScanStatus.PASSED,
             status=AppStatus.APPROVED,
             approved_at=datetime.now(timezone.utc),
@@ -176,6 +218,7 @@ try:
         db.session.add(store_app)
         db.session.commit()
         app_id = store_app.id
+        developer_id = developer.id
         pending_developer_id = pending_developer.id
 
     client = app.test_client()
@@ -220,6 +263,87 @@ try:
     assert b"sent to the administrator" in report.data
     dashboard = client.get("/user/dashboard")
     assert dashboard.status_code == 200 and b"Workflow App" in dashboard.data
+    recovery_client = app.test_client()
+    recovery_token = csrf(
+        recovery_client, "/forgot-password/security-question?role=user"
+    )
+    rejected_recovery = recovery_client.post(
+        "/forgot-password/security-question",
+        data={
+            "csrf_token": recovery_token,
+            "role": "user",
+            "identifier": "market_user",
+            "security_question": "private_phrase",
+            "security_answer": "wrong answer",
+        },
+        follow_redirects=True,
+    )
+    assert b"could not be verified" in rejected_recovery.data
+    recovery_token = csrf(
+        recovery_client, "/forgot-password/security-question?role=user"
+    )
+    accepted_recovery = recovery_client.post(
+        "/forgot-password/security-question",
+        data={
+            "csrf_token": recovery_token,
+            "role": "user",
+            "identifier": "user@example.com",
+            "security_question": "private_phrase",
+            "security_answer": "  blue   lantern 42 ",
+        },
+    )
+    assert accepted_recovery.status_code == 302
+    assert "/reset-password/" in accepted_recovery.location
+    if os.environ.get("RUN_PERFORMANCE_TEST") == "1":
+        from _performance_test import benchmark
+        benchmark(app)
+        raise SystemExit(0)
+    # Optional read-only UI preview, using this test's disposable accounts only.
+    if os.environ.get("UI_PREVIEW_PORT"):
+        from flask import Flask, abort
+
+        with app.app_context():
+            preview_developer = User.query.filter_by(username="market_dev").one()
+            preview_developer.developer_profile = DeveloperProfile(
+                legal_name="Preview Developer", country="India", phone="0000000000",
+                government_id_type=GovernmentIdType.PASSPORT,
+                government_id_number="TEST-ONLY", government_id_file="test-only.png",
+                government_id_original_name="test-only.png",
+                submitted_at=datetime.now(timezone.utc),
+            )
+            db.session.commit()
+
+        developer_client = app.test_client()
+        developer_token = csrf(developer_client, "/login/developer")
+        developer_client.post("/login/developer", data={
+            "csrf_token": developer_token,
+            "identifier": "market_dev", "password": "DevPass123!",
+        })
+        previews = {
+            "/admin": admin_client.get("/admin"),
+            "/user/dashboard": dashboard,
+            "/developer/dashboard": developer_client.get("/developer/dashboard"),
+            "/apps/workflow-app": client.get("/apps/workflow-app"),
+        }
+        assert all(response.status_code == 200 for response in previews.values()), [(path, response.status_code, response.location) for path, response in previews.items()]
+        preview = Flask("ui_preview", static_folder=str(Path(__file__).parent / "static"))
+
+        @preview.get("/<path:path>")
+        def preview_page(path):
+            response = previews.get("/" + path)
+            return response.data if response is not None else abort(404)
+
+        preview.run(host="127.0.0.1", port=int(os.environ["UI_PREVIEW_PORT"]))
+    stale_client = app.test_client()
+    stale_token = csrf(stale_client, "/login/user")
+    assert stale_client.post(
+        "/login/user",
+        data={
+            "csrf_token": stale_token,
+            "identifier": "market_user",
+            "password": "UserPass123!",
+        },
+    ).status_code == 302
     token = csrf(client, "/account/settings")
     settings = client.post(
         "/account/settings",
@@ -227,31 +351,31 @@ try:
             "csrf_token": token,
             "email": "updated@example.com",
             "current_password": "UserPass123!",
-            "new_password": "NewPass123!",
-            "confirm_password": "NewPass123!",
+            "new_password": "NewPassword123!",
+            "confirm_password": "NewPassword123!",
         },
         follow_redirects=True,
     )
     assert b"settings were updated" in settings.data
+    assert stale_client.get("/user/dashboard").status_code == 302
 
     client = app.test_client()
+    token = csrf(client, "/forgot-password")
+    client.post(
+        "/forgot-password",
+        data={"csrf_token": token, "email": "admin@example.com", "role": "user"},
+    )
+    with app.app_context():
+        admin_user = User.query.filter_by(username="workflow_admin").one()
+        assert PasswordResetToken.query.filter_by(user_id=admin_user.id).count() == 0
     token = csrf(client, "/forgot-password")
     recovery = client.post(
         "/forgot-password", data={"csrf_token": token, "email": "updated@example.com"}
     )
     assert b"/reset-password/" not in recovery.data
-    app.debug = True
-    token = csrf(client, "/forgot-password")
-    recovery = client.post(
-        "/forgot-password", data={"csrf_token": token, "email": "updated@example.com"}
-    )
-    reset_path = (
-        re.search(
-            rb'href="http://127\.0\.0\.1:5001(/reset-password/[^"]+)"', recovery.data
-        )
-        .group(1)
-        .decode()
-    )
+    with app.app_context():
+        reset_user = User.query.filter_by(email="updated@example.com").one()
+        reset_path = f"/reset-password/{issue_password_reset(reset_user)}"
     token = csrf(client, reset_path)
     reset = client.post(
         reset_path,
@@ -300,6 +424,40 @@ try:
         follow_redirects=True,
     )
     assert b"settings were updated securely" in updated_settings.data
+    upload_defaults = admin.post(
+        "/admin/settings",
+        data={
+            "csrf_token": admin_token,
+            "settings_section": "marketplace",
+            "default_app_limit": "1",
+            "max_apk_size_mb": "150",
+        },
+        follow_redirects=True,
+    )
+    assert b"upload defaults were updated" in upload_defaults.data
+    developer_client = app.test_client()
+    developer_token = csrf(developer_client, "/login/developer")
+    developer_client.post(
+        "/login/developer",
+        data={
+            "csrf_token": developer_token,
+            "identifier": "market_dev",
+            "password": "DevPass123!",
+        },
+    )
+    assert developer_client.get("/developer/apps/new").status_code == 302
+    override = admin.post(
+        f"/admin/developers/{developer_id}/upload-limit",
+        data={"csrf_token": admin_token, "app_upload_limit": "2"},
+        follow_redirects=True,
+    )
+    assert b"Upload limit for market_dev was updated" in override.data
+    assert developer_client.get("/developer/apps/new").status_code == 200
+    with app.app_context():
+        settings_record = db.session.get(MarketplaceSettings, 1)
+        assert settings_record.default_app_limit == 1
+        assert settings_record.max_apk_size_mb == 150
+        assert db.session.get(User, developer_id).app_upload_limit == 2
     for action in ("approve", "block", "unblock", "reject"):
         response = admin.post(
             f"/admin/accounts/{pending_developer_id}/{action}",

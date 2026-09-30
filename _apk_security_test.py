@@ -27,6 +27,14 @@ from application.models import (
 )
 
 app.config["TESTING"] = True
+assert {
+    "--scan-archive=yes",
+    "--detect-pua=yes",
+    "--detect-structured=yes",
+    "--heuristic-alerts=yes",
+    "--phishing-sigs=yes",
+    "--bytecode=yes",
+}.issubset(controllers.CLAMAV_SCAN_OPTIONS)
 real_malware_scanner = controllers.scan_apk_for_malware
 with app.app_context():
     configured_scanner = app.config["CLAMAV_COMMAND"]
@@ -145,10 +153,29 @@ try:
     token = csrf(admin, "/admin/login")
     admin.post("/admin/login", data={"csrf_token": token, "identifier": "security_admin", "password": "AdminPass123!"})
     review = admin.get(f"/admin/apps/{app_id}")
-    assert review.status_code == 200 and b"Structural safety: Passed" in review.data
-    assert b"Malware scan: Clean" in review.data
+    assert review.status_code == 200 and b"60-point APK security scan" in review.data
+    assert b"Administrator scan required" in review.data
     with admin.session_transaction() as session:
         admin_token = session["_csrf_token"]
+    blocked = admin.post(f"/admin/apps/{app_id}/approve", data={"csrf_token": admin_token}, follow_redirects=True)
+    assert b"Run the 60-point administrator security scan" in blocked.data
+    scanned = admin.post(
+        f"/admin/apps/{app_id}/scan",
+        data={"csrf_token": admin_token, "target": "current"},
+        follow_redirects=True,
+    )
+    assert scanned.status_code == 200 and b"checks passed" in scanned.data
+    with app.app_context():
+        secure_app = db.session.get(StoreApp, app_id)
+        report = controllers.parse_deep_scan_report(secure_app.security_scan_summary)
+        assert report["total"] == 60 and report["failed"] == 0
+    download = admin.get(f"/admin/apps/{app_id}/scan-report?target=current")
+    exported = download.get_json()
+    assert download.status_code == 200
+    assert "attachment" in download.headers["Content-Disposition"]
+    assert exported["app"]["sha256"]
+    assert exported["static_analysis"]["total"] == 60
+    assert "known malware and ransomware signatures" in exported["malware_analysis"]["coverage"]
     approved = admin.post(f"/admin/apps/{app_id}/approve", data={"csrf_token": admin_token}, follow_redirects=True)
     assert approved.status_code == 200
     print("apk-security-tests-passed")

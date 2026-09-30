@@ -13,7 +13,7 @@
             rel="stylesheet"><link
             href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css"
             rel="stylesheet"><link rel="stylesheet"
-            href="{{ url_for('static', filename='style.css') }}"></head>
+            href="{{ url_for('static', filename='style.css') }}"><link rel="stylesheet" href="{{ url_for('static', filename='interior-3d.css') }}"><script nonce="{{ csp_nonce }}" defer src="{{ url_for('static', filename='interior-3d.js') }}"></script></head>
     <body class="marketplace-page">
         <nav class="navbar navbar-expand-lg marketplace-nav"><div
                 class="container"><a class="navbar-brand"
@@ -21,7 +21,7 @@
                         class="brand-mark"><i
                             class="bi bi-boxes"></i></span>Appora</a><button
                     class="navbar-toggler border-0" type="button"
-                    data-bs-toggle="collapse" data-bs-target="#marketNav"><span
+                    data-bs-toggle="collapse" data-bs-target="#marketNav" aria-controls="marketNav" aria-expanded="false" aria-label="Toggle navigation"><span
                         class="navbar-toggler-icon"></span></button><div
                     class="collapse navbar-collapse" id="marketNav"><ul
                         class="navbar-nav mx-auto"><li class="nav-item"><a
@@ -31,7 +31,7 @@
                                 href="{{ url_for('main.home') }}#safety">App
                                 safety</a></li><li class="nav-item"><a
                                 class="nav-link"
-                                href="{{ url_for('main.home') }}#developers">For
+                                href="{{ url_for('main.home') }}#creators">For
                                 developers</a></li></ul><div
                         class="d-flex gap-2"><a
                             class="btn btn-outline-dark rounded-pill px-3"
@@ -95,6 +95,6 @@
         <footer class="marketplace-footer"><div class="container"><a
                     class="navbar-brand" href="{{ url_for('main.home') }}"><span
                         class="brand-mark"><i
-                            class="bi bi-boxes"></i></span>Appora</a><span><a href="{{ url_for('main.privacy_policy') }}">Privacy</a> · <a href="{{ url_for('main.terms_of_service') }}">Terms</a> · <a href="{{ url_for('main.policy_center') }}">Policies</a></span></div></footer><script
+                            class="bi bi-boxes"></i></span>Appora</a><span><a href="{{ url_for('main.privacy_policy') }}">Privacy</a> · <a href="{{ url_for('main.terms_of_service') }}">Terms</a> · <a href="{{ url_for('main.policy_center') }}">Policies</a></span></div></footer><script nonce="{{ csp_nonce }}"
             src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     </body></html>

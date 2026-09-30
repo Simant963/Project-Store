@@ -50,7 +50,7 @@ if (-not (Test-Path -LiteralPath $environmentPath)) {
     }
 
     $requiredSettings = @(
-        "APP_ENV", "SECRET_KEY", "DATABASE_URL", "ADMIN_EMAIL", "ADMIN_PASSWORD",
+        "APP_ENV", "SECRET_KEY", "DATABASE_URL", "REDIS_URL", "ADMIN_EMAIL", "ADMIN_PASSWORD",
         "PUBLIC_BASE_URL", "PRIVATE_UPLOAD_ROOT", "SMTP_HOST", "SMTP_FROM_EMAIL",
         "LEGAL_OPERATOR_NAME", "LEGAL_ADDRESS", "SUPPORT_EMAIL", "PRIVACY_EMAIL",
         "GRIEVANCE_OFFICER_NAME", "GRIEVANCE_EMAIL"
@@ -69,6 +69,7 @@ if (-not (Test-Path -LiteralPath $environmentPath)) {
     if ($settings["AUTO_MIGRATE"] -ne "false") { Add-Failure "AUTO_MIGRATE must be false" }
     if ($settings["PUBLIC_BASE_URL"] -notmatch "^https://") { Add-Failure "PUBLIC_BASE_URL must use HTTPS" }
     if ($settings["DATABASE_URL"] -notmatch "^postgresql(\+psycopg)?://") { Add-Failure "DATABASE_URL must use PostgreSQL" }
+    if ($settings["REDIS_URL"] -notmatch "^rediss?://") { Add-Failure "REDIS_URL must use Redis" }
     $secretKey = [string]$settings["SECRET_KEY"]
     $adminPassword = [string]$settings["ADMIN_PASSWORD"]
     if ($secretKey.Length -lt 32) { Add-Failure "SECRET_KEY must contain at least 32 characters" }
@@ -97,6 +98,16 @@ if (-not $SkipTests) {
         if ($LASTEXITCODE -ne 0) { Add-Failure "APK security regression tests failed" } else { Add-Pass "APK security regression tests passed" }
         & $python (Join-Path $projectRoot "_marketplace_workflow_test.py")
         if ($LASTEXITCODE -ne 0) { Add-Failure "Marketplace workflow tests failed" } else { Add-Pass "Marketplace workflow tests passed" }
+        & $python (Join-Path $projectRoot "_web_security_test.py")
+        if ($LASTEXITCODE -ne 0) { Add-Failure "Web confidentiality and security tests failed" } else { Add-Pass "Web confidentiality and security tests passed" }
+        & $python (Join-Path $projectRoot "_legal_links_test.py")
+        if ($LASTEXITCODE -ne 0) { Add-Failure "Legal page and link tests failed" } else { Add-Pass "Legal page and link tests passed" }
+        if (Get-Command node -ErrorAction SilentlyContinue) {
+            & node (Join-Path $projectRoot "_ui_motion_test.cjs")
+            if ($LASTEXITCODE -ne 0) { Add-Failure "UI motion tests failed" } else { Add-Pass "UI motion tests passed" }
+        } else {
+            Add-Failure "Node.js is unavailable; UI motion tests could not run"
+        }
         Push-Location $projectRoot
         try { & $flask --app app db check } finally { Pop-Location }
         if ($LASTEXITCODE -ne 0) { Add-Failure "Database models require a migration" } else { Add-Pass "Database migration state is current" }
