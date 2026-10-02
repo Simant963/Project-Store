@@ -62,6 +62,20 @@ services:
       retries: 5
       start_period: 30s
 
+  monitor:
+    build: .
+    restart: unless-stopped
+    command: ["python", "deployment/monitor.py"]
+    env_file:
+      - path: ./deployment/.env.monitor
+        required: false
+    user: root
+    depends_on:
+      web:
+        condition: service_started
+    volumes:
+      - monitor_data:/data/monitor
+
   proxy:
     image: nginx:1.27-alpine
     restart: unless-stopped
@@ -76,6 +90,7 @@ services:
       - ./deployment/certs:/etc/nginx/certs:ro
 
 volumes:
+  monitor_data:
   private_uploads:
   clamav_data:
   redis_data:

@@ -71,6 +71,18 @@ class ReleaseStatus(str, Enum):
     REJECTED = "rejected"
 
 
+class SubmissionStatus(str, Enum):
+    UPLOADED = "UPLOADED"
+    SECURITY_CHECK_PENDING = "SECURITY_CHECK_PENDING"
+    SECURITY_CHECK_PASSED = "SECURITY_CHECK_PASSED"
+    SECURITY_CHECK_FAILED = "SECURITY_CHECK_FAILED"
+    ADMIN_REVIEW_PENDING = "ADMIN_REVIEW_PENDING"
+    ADMIN_VERIFIED = "ADMIN_VERIFIED"
+    ADMIN_REJECTED = "ADMIN_REJECTED"
+    PUBLISH_PENDING = "PUBLISH_PENDING"
+    PUBLISHED = "PUBLISHED"
+
+
 class SecurityScanStatus(str, Enum):
     UNSCANNED = "unscanned"
     PASSED = "passed"
@@ -104,6 +116,14 @@ class AuditAction(str, Enum):
     RELEASE_MODERATION = "release_moderation"
     REPORT_MODERATION = "report_moderation"
     REVIEW_MODERATION = "review_moderation"
+    PASSWORD_RECOVERY = "password_recovery"
+
+
+class ManualResetStatus(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    USED = "used"
 
 
 class NotificationType(str, Enum):
@@ -199,6 +219,7 @@ class User(db.Model):
     apps = db.relationship(
         "StoreApp",
         back_populates="developer",
+        foreign_keys="StoreApp.developer_id",
         cascade="all, delete-orphan",
         order_by="StoreApp.created_at.desc()",
     )
@@ -340,6 +361,23 @@ class StoreApp(db.Model):
     )
 
     id = db.Column(db.Integer, primary_key=True)
+    submission_status = db.Column(
+        db.Enum(SubmissionStatus, values_callable=enum_values, native_enum=False,
+                validate_strings=True, length=30),
+        nullable=False, default=SubmissionStatus.UPLOADED, index=True,
+    )
+    submission_revision = db.Column(db.Integer, nullable=False, default=1)
+    __mapper_args__ = {"version_id_col": submission_revision}
+    verified_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    verified_by_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True)
+    published_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    submission_feedback = db.Column(db.Text, nullable=True)
+    changes_requested = db.Column(db.Boolean, nullable=False, default=False)
+    scan_started_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    submission_history = db.relationship(
+        "ApplicationStatusHistory", back_populates="app", cascade="all, delete-orphan",
+        order_by="ApplicationStatusHistory.id.desc()",
+    )
     developer_id = db.Column(
         db.Integer,
         db.ForeignKey("user.id"),
@@ -488,7 +526,7 @@ class StoreApp(db.Model):
         onupdate=lambda: datetime.now(timezone.utc),
     )
 
-    developer = db.relationship("User", back_populates="apps")
+    developer = db.relationship("User", back_populates="apps", foreign_keys=[developer_id])
     version_history = db.relationship(
         "AppVersionHistory",
         back_populates="app",
@@ -599,6 +637,22 @@ class StoreApp(db.Model):
         self.pending_release_submitted_at = None
 
 
+class ApplicationStatusHistory(db.Model):
+    __tablename__ = "application_status_history"
+    id = db.Column(db.Integer, primary_key=True)
+    application_id = db.Column(db.Integer, db.ForeignKey("store_app.id"), nullable=False, index=True)
+    version = db.Column(db.String(40), nullable=False)
+    previous_status = db.Column(db.String(30), nullable=True)
+    new_status = db.Column(db.String(30), nullable=False)
+    changed_by_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True)
+    changed_by_role = db.Column(db.String(20), nullable=False)
+    reason = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False,
+                           default=lambda: datetime.now(timezone.utc))
+    app = db.relationship("StoreApp", back_populates="submission_history")
+    changed_by = db.relationship("User")
+
+
 class MarketplaceSettings(db.Model):
     __tablename__ = "marketplace_settings"
 
@@ -693,6 +747,58 @@ class PasswordResetToken(db.Model):
         if expires.tzinfo is None:
             expires = expires.replace(tzinfo=timezone.utc)
         return self.used_at is None and expires > datetime.now(timezone.utc)
+
+
+class ManualPasswordReset(db.Model):
+    __tablename__ = "manual_password_reset"
+    __table_args__ = (
+        db.Index("ix_manual_reset_status_created", "status", "created_at"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    reference = db.Column(db.String(24), unique=True, nullable=False, index=True)
+    user_id = db.Column(
+        db.Integer, db.ForeignKey("user.id"), nullable=False, index=True
+    )
+    status = db.Column(
+        db.Enum(
+            ManualResetStatus,
+            values_callable=enum_values,
+            native_enum=False,
+            validate_strings=True,
+            length=20,
+        ),
+        nullable=False,
+        default=ManualResetStatus.PENDING,
+        index=True,
+    )
+    code_hash = db.Column(db.String(64), nullable=True)
+    code_expires_at = db.Column(db.DateTime(timezone=True), nullable=True, index=True)
+    failed_attempts = db.Column(db.Integer, nullable=False, default=0)
+    reviewed_by_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True)
+    reviewed_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    used_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    created_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    user = db.relationship("User", foreign_keys=[user_id])
+    reviewed_by = db.relationship("User", foreign_keys=[reviewed_by_id])
+
+    @property
+    def code_is_valid(self):
+        if self.status != ManualResetStatus.APPROVED or not self.code_expires_at:
+            return False
+        expires = self.code_expires_at
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return (
+            self.used_at is None
+            and self.failed_attempts < 5
+            and expires > datetime.now(timezone.utc)
+        )
 
 
 class LoginThrottle(db.Model):

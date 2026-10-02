@@ -1,0 +1,53 @@
+:root {
+    --submission-success: #b2f3cf;
+    --submission-active: #c7a5ff;
+    --submission-error: #ffc1cc;
+    --submission-muted: #cbc5d3;
+    --submission-surface: #191722;
+    --submission-border: #51465d;
+}
+.submission-panel { margin:24px 0; padding:24px; background:var(--submission-surface); color:var(--submission-muted); border:1px solid var(--submission-border); border-radius:20px; box-shadow:0 14px 40px #0003; }
+.submission-panel-title,.submission-progress-heading { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+.submission-panel h2 { font-size:1.4rem; color:inherit; }
+.submission-progress { width:100%; min-width:0; padding:18px 0; }
+.submission-status { font-weight:700; color:var(--submission-active); overflow-wrap:anywhere; }
+.submission-steps { list-style:none; padding:0; margin:24px 0 16px; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); }
+.submission-step { position:relative; display:flex; flex-direction:column; gap:12px; padding:0 14px 0 0; color:var(--submission-muted); }
+.submission-step::after { content:""; position:absolute; height:2px; background:var(--submission-border); top:19px; left:42px; right:5px; }
+.submission-step:last-child::after { display:none; }
+.submission-step.completed::after { background:var(--submission-success); }
+.submission-step-icon { width:40px; height:40px; border-radius:50%; display:grid; place-items:center; border:2px solid currentColor; background:var(--submission-surface); }
+.submission-step strong,.submission-step small,.submission-step time { display:block; font-size:.85rem; line-height:1.6; }
+.submission-step time { font-size:.75rem; color:var(--submission-muted); }
+.submission-step.completed { color:var(--submission-success); }
+.submission-step.active { color:var(--submission-active); }
+.submission-step.active .submission-step-icon { box-shadow:0 0 0 5px color-mix(in srgb,var(--submission-active) 16%,transparent); }
+.submission-step.failed,.submission-step.rejected { color:var(--submission-error); }
+.submission-step.upcoming .submission-step-icon { border-style:dashed; }
+.submission-updated,.submission-connection { font-size:.8rem; color:var(--submission-muted); }
+.submission-feedback { padding:16px; margin:20px 0; border:1px solid var(--submission-border); border-radius:12px; white-space:pre-wrap; overflow-wrap:anywhere; }
+.submission-feedback.error { color:var(--submission-error); border-color:var(--submission-error); }
+.submission-success { color:var(--submission-success); }
+.submission-actions { display:flex; flex-wrap:wrap; gap:16px; margin:24px 0; }
+.submission-actions form { flex:1 1 220px; max-width:420px; display:flex; flex-direction:column; align-items:flex-start; gap:12px; }
+.submission-actions textarea { width:100%; background:var(--submission-surface); color:var(--submission-muted); border:1px solid var(--submission-border); border-radius:10px; padding:12px; }
+.submission-actions button { min-height:44px; }
+.submission-history { border-top:1px solid var(--submission-border); padding-top:20px; margin-top:24px; }
+.submission-history summary { cursor:pointer; min-height:44px; }
+.submission-history li { padding:12px; overflow-wrap:anywhere; }
+.submission-history p { margin:4px 0; }
+.submission-row td { padding:0 20px 20px; }
+.submission-confirm { width:min(480px,calc(100% - 32px)); color:var(--submission-muted); background:var(--submission-surface); border:1px solid var(--submission-border); border-radius:20px; padding:24px; }
+.submission-confirm::backdrop { background:#000b; }
+.submission-confirm form { display:flex; justify-content:flex-end; gap:12px; }
+.submission-confirm button { min-height:44px; }
+.submission-progress [aria-busy="true"] { opacity:.6; }
+.submission-panel :focus-visible,.submission-confirm :focus-visible { outline:3px solid var(--submission-active); outline-offset:3px; }
+@media(max-width:600px) {
+    .submission-panel { padding:18px; }
+    .submission-steps { grid-template-columns:1fr; gap:20px; }
+    .submission-step { flex-direction:row; align-items:flex-start; }
+    .submission-step::after { top:42px; left:19px; right:auto; width:2px; height:calc(100% - 22px); }
+    .submission-step-icon { flex-shrink:0; }
+    .submission-actions form { max-width:100%; }
+}

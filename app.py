@@ -13,7 +13,8 @@ from alembic.script import ScriptDirectory
 from flask_migrate import upgrade
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
-from werkzeug.exceptions import HTTPException
+from sqlalchemy.orm.exc import StaleDataError
+from werkzeug.exceptions import HTTPException, SecurityError
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from application.database import db, migrate
@@ -77,6 +78,9 @@ def create_app():
         "true",
         "yes",
     }
+    app.config["PASSWORD_RESET_MODE"] = os.getenv(
+        "PASSWORD_RESET_MODE", "manual"
+    ).lower()
     app.config["ADMIN_USERNAME"] = os.getenv("ADMIN_USERNAME", "admin")
     app.config["ADMIN_EMAIL"] = os.getenv("ADMIN_EMAIL", "admin@appora.local")
     app.config["ADMIN_PASSWORD"] = os.getenv("ADMIN_PASSWORD")
@@ -154,14 +158,21 @@ def create_app():
             configuration_errors.append(
                 "PRIVATE_UPLOAD_ROOT must be an absolute production path"
             )
-        if not app.config["SMTP_HOST"]:
+        if app.config["PASSWORD_RESET_MODE"] not in {"manual", "email"}:
             configuration_errors.append(
-                "SMTP_HOST is required for password-reset email"
+                "PASSWORD_RESET_MODE must be either manual or email"
             )
-        if not app.config["SMTP_FROM_EMAIL"] or app.config["SMTP_FROM_EMAIL"].endswith(
-            ".local"
-        ):
-            configuration_errors.append("SMTP_FROM_EMAIL must be a real sender address")
+        if app.config["PASSWORD_RESET_MODE"] == "email":
+            if not app.config["SMTP_HOST"]:
+                configuration_errors.append(
+                    "SMTP_HOST is required when PASSWORD_RESET_MODE=email"
+                )
+            if not app.config["SMTP_FROM_EMAIL"] or app.config[
+                "SMTP_FROM_EMAIL"
+            ].endswith(".local"):
+                configuration_errors.append(
+                    "SMTP_FROM_EMAIL must be a real sender address"
+                )
         for key in ("SUPPORT_EMAIL", "PRIVACY_EMAIL", "GRIEVANCE_EMAIL"):
             if not app.config[key] or app.config[key].endswith(".local"):
                 configuration_errors.append(f"{key} must be a real monitored address")
@@ -207,7 +218,13 @@ def create_app():
 
     @app.context_processor
     def security_template_values():
-        return {"csp_nonce": g.csp_nonce}
+        from application.submission_workflow import submission_view
+        return {"csp_nonce": g.csp_nonce, "submission_view": submission_view}
+
+    @app.errorhandler(StaleDataError)
+    def stale_submission(error):
+        db.session.rollback()
+        return jsonify({"ok": False, "message": "Another request changed this application. Refresh and try again."}), 409
 
     @app.after_request
     def apply_security_headers(response):
@@ -231,7 +248,7 @@ def create_app():
             "default-src 'self'; img-src 'self' data:; "
             "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
             "font-src 'self' https://cdn.jsdelivr.net https://fonts.gstatic.com; "
-            f"script-src 'self' 'nonce-{g.csp_nonce}' https://cdn.jsdelivr.net; "
+            f"script-src 'self' 'nonce-{getattr(g, 'csp_nonce', secrets.token_urlsafe(18))}' https://cdn.jsdelivr.net; "
             "connect-src 'self'; object-src 'none'; base-uri 'self'; "
             "form-action 'self'; frame-ancestors 'none'; manifest-src 'self'",
         )
@@ -243,6 +260,7 @@ def create_app():
                 "main.account_login",
                 "main.forgot_password",
                 "main.security_question_recovery",
+                "main.manual_password_reset",
                 "main.reset_password",
             }
         ):
@@ -264,6 +282,7 @@ def create_app():
             "main.create_account",
             "main.forgot_password",
             "main.security_question_recovery",
+            "main.manual_password_reset",
             "main.reset_password",
             "main.account_settings",
         }
@@ -283,7 +302,7 @@ def create_app():
         """Verify required dependencies before accepting marketplace traffic."""
         checks = {"database": False, "schema": False, "private_storage": False}
         if app.config["APP_ENV"] == "production":
-            checks.update({"smtp_config": False, "clamav": False})
+            checks.update({"password_reset": False, "clamav": False, "redis": False})
         try:
             db.session.execute(text("SELECT 1"))
             checks["database"] = True
@@ -310,13 +329,26 @@ def create_app():
             app.logger.exception("Readiness private storage check failed.")
 
         if app.config["APP_ENV"] == "production":
-            checks["smtp_config"] = bool(
-                app.config["SMTP_HOST"] and app.config["SMTP_FROM_EMAIL"]
+            checks["password_reset"] = (
+                app.config["PASSWORD_RESET_MODE"] == "manual"
+                or bool(app.config["SMTP_HOST"] and app.config["SMTP_FROM_EMAIL"])
             )
             clamav_command = app.config["CLAMAV_COMMAND"]
             checks["clamav"] = bool(
                 shutil.which(clamav_command) or Path(clamav_command).is_file()
             )
+            try:
+                from redis import Redis
+
+                redis_check = Redis.from_url(
+                    app.config["REDIS_URL"], socket_connect_timeout=2, socket_timeout=2
+                )
+                try:
+                    checks["redis"] = bool(redis_check.ping())
+                finally:
+                    redis_check.close()
+            except Exception:
+                app.logger.error("Readiness Redis check failed.")
 
         ready = all(checks.values())
         response = jsonify(
@@ -327,6 +359,8 @@ def create_app():
         return response
 
     def render_safe_error(status_code, title, message, icon):
+        if isinstance(request.routing_exception, SecurityError):
+            return "Invalid request host.", 400, {"Content-Type": "text/plain; charset=utf-8"}
         return render_template(
             "error.html",
             status_code=status_code,

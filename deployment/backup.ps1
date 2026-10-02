@@ -15,7 +15,12 @@ $databaseUrl = (Get-Content -LiteralPath (Join-Path $projectRoot ".env.productio
     Where-Object { $_ -match '^DATABASE_URL=' } | Select-Object -First 1) -replace '^DATABASE_URL=', ''
 if (-not $databaseUrl) { throw "DATABASE_URL is missing from .env.production" }
 $env:APPORA_BACKUP_DATABASE_URL = $databaseUrl -replace '^postgresql\+psycopg://', 'postgresql://'
-$compose = docker compose --env-file .env.production -f docker-compose.production.yml config --format json | ConvertFrom-Json
+$composeJson = if (Get-Command docker-compose -ErrorAction SilentlyContinue) {
+    docker-compose --env-file .env.production -f docker-compose.production.yml config --format json
+} else {
+    docker compose --env-file .env.production -f docker-compose.production.yml config --format json
+}
+$compose = $composeJson | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0) { throw "Could not read the Docker Compose project configuration." }
 $network = "$($compose.name)_default"
 $uploadsVolume = "$($compose.name)_private_uploads"
@@ -23,7 +28,7 @@ $databaseName = Split-Path -Leaf $databaseFile
 $uploadsName = Split-Path -Leaf $uploadsFile
 docker run --rm --network $network -e APPORA_BACKUP_DATABASE_URL `
     -e "APPORA_BACKUP_FILE=$databaseName" -v "${backupRoot}:/backup" postgres:17-alpine `
-    sh -c 'pg_dump "$APPORA_BACKUP_DATABASE_URL" -Fc -f "/backup/$APPORA_BACKUP_FILE"'
+    sh -c 'pg_dump "$APPORA_BACKUP_DATABASE_URL" -Fc --schema=public --no-owner --no-acl -f "/backup/$APPORA_BACKUP_FILE"'
 if ($LASTEXITCODE -ne 0 -or (Get-Item -LiteralPath $databaseFile).Length -eq 0) {
     Remove-Item -LiteralPath $databaseFile -Force -ErrorAction SilentlyContinue
     throw "Database backup failed; no usable dump was kept."

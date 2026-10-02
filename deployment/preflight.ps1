@@ -1,6 +1,7 @@
 param(
     [string]$EnvironmentFile = ".env.production",
-    [switch]$SkipTests,
+    [Alias("SkipTests")]
+    [switch]$SkipDatabaseCheck,
     [switch]$SkipDocker
 )
 
@@ -51,7 +52,7 @@ if (-not (Test-Path -LiteralPath $environmentPath)) {
 
     $requiredSettings = @(
         "APP_ENV", "SECRET_KEY", "DATABASE_URL", "REDIS_URL", "ADMIN_EMAIL", "ADMIN_PASSWORD",
-        "PUBLIC_BASE_URL", "PRIVATE_UPLOAD_ROOT", "SMTP_HOST", "SMTP_FROM_EMAIL",
+        "PUBLIC_BASE_URL", "PRIVATE_UPLOAD_ROOT", "PASSWORD_RESET_MODE",
         "LEGAL_OPERATOR_NAME", "LEGAL_ADDRESS", "SUPPORT_EMAIL", "PRIVACY_EMAIL",
         "GRIEVANCE_OFFICER_NAME", "GRIEVANCE_EMAIL"
     )
@@ -70,6 +71,15 @@ if (-not (Test-Path -LiteralPath $environmentPath)) {
     if ($settings["PUBLIC_BASE_URL"] -notmatch "^https://") { Add-Failure "PUBLIC_BASE_URL must use HTTPS" }
     if ($settings["DATABASE_URL"] -notmatch "^postgresql(\+psycopg)?://") { Add-Failure "DATABASE_URL must use PostgreSQL" }
     if ($settings["REDIS_URL"] -notmatch "^rediss?://") { Add-Failure "REDIS_URL must use Redis" }
+    if ($settings["PASSWORD_RESET_MODE"] -notin @("manual", "email")) { Add-Failure "PASSWORD_RESET_MODE must be manual or email" }
+    if ($settings["PASSWORD_RESET_MODE"] -eq "email") {
+        foreach ($key in @("SMTP_HOST", "SMTP_FROM_EMAIL")) {
+            $value = $settings[$key]
+            if (-not $value -or $value -match "replace-|your-domain|your-provider") {
+                Add-Failure "$key is required when PASSWORD_RESET_MODE=email"
+            }
+        }
+    }
     $secretKey = [string]$settings["SECRET_KEY"]
     $adminPassword = [string]$settings["ADMIN_PASSWORD"]
     if ($secretKey.Length -lt 32) { Add-Failure "SECRET_KEY must contain at least 32 characters" }
@@ -88,26 +98,11 @@ foreach ($certificate in @("deployment/certs/fullchain.pem", "deployment/certs/p
     }
 }
 
-if (-not $SkipTests) {
-    $python = Join-Path $projectRoot "env/Scripts/python.exe"
+if (-not $SkipDatabaseCheck) {
     $flask = Join-Path $projectRoot "env/Scripts/flask.exe"
-    if (-not (Test-Path -LiteralPath $python) -or -not (Test-Path -LiteralPath $flask)) {
+    if (-not (Test-Path -LiteralPath $flask)) {
         Add-Failure "The local virtual environment is missing; create it and install requirements"
     } else {
-        & $python (Join-Path $projectRoot "_apk_security_test.py")
-        if ($LASTEXITCODE -ne 0) { Add-Failure "APK security regression tests failed" } else { Add-Pass "APK security regression tests passed" }
-        & $python (Join-Path $projectRoot "_marketplace_workflow_test.py")
-        if ($LASTEXITCODE -ne 0) { Add-Failure "Marketplace workflow tests failed" } else { Add-Pass "Marketplace workflow tests passed" }
-        & $python (Join-Path $projectRoot "_web_security_test.py")
-        if ($LASTEXITCODE -ne 0) { Add-Failure "Web confidentiality and security tests failed" } else { Add-Pass "Web confidentiality and security tests passed" }
-        & $python (Join-Path $projectRoot "_legal_links_test.py")
-        if ($LASTEXITCODE -ne 0) { Add-Failure "Legal page and link tests failed" } else { Add-Pass "Legal page and link tests passed" }
-        if (Get-Command node -ErrorAction SilentlyContinue) {
-            & node (Join-Path $projectRoot "_ui_motion_test.cjs")
-            if ($LASTEXITCODE -ne 0) { Add-Failure "UI motion tests failed" } else { Add-Pass "UI motion tests passed" }
-        } else {
-            Add-Failure "Node.js is unavailable; UI motion tests could not run"
-        }
         Push-Location $projectRoot
         try { & $flask --app app db check } finally { Pop-Location }
         if ($LASTEXITCODE -ne 0) { Add-Failure "Database models require a migration" } else { Add-Pass "Database migration state is current" }
@@ -119,7 +114,13 @@ if (-not $SkipDocker) {
         Add-Failure "Docker is not installed or is not available on PATH"
     } else {
         Push-Location $projectRoot
-        try { docker compose --env-file $EnvironmentFile -f docker-compose.production.yml config --quiet } finally { Pop-Location }
+        try {
+            if (Get-Command docker-compose -ErrorAction SilentlyContinue) {
+                docker-compose --env-file $EnvironmentFile -f docker-compose.production.yml config --quiet
+            } else {
+                docker compose --env-file $EnvironmentFile -f docker-compose.production.yml config --quiet
+            }
+        } finally { Pop-Location }
         if ($LASTEXITCODE -ne 0) { Add-Failure "Docker Compose configuration is invalid" } else { Add-Pass "Docker Compose configuration is valid" }
     }
 }

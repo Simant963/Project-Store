@@ -1,0 +1,13 @@
+{% set progress = submission_view(app_record) %}
+<div class="submission-progress" data-submission-progress="{{ app_record.id }}" data-revision="{{ progress.revision }}">
+    <div class="submission-progress-heading"><span class="submission-status" data-submission-label="{{ app_record.id }}">{{ progress.label }}</span><small>Stage {{ progress.stage }} of 4 · v{{ progress.version }}</small></div>
+    <ol class="submission-steps" aria-label="Submission progress for {{ app_record.name }}">
+    {% for step in progress.steps %}
+        <li class="submission-step {{ step.state }}" {% if step.state == 'active' %}aria-current="step"{% endif %}>
+            <span class="submission-step-icon" aria-hidden="true"><i class="bi {{ 'bi-check-lg' if step.state == 'completed' else 'bi-x-lg' if step.state in ['failed', 'rejected'] else 'bi-hourglass-split' if step.state == 'active' else 'bi-circle' }}"></i></span>
+            <div><strong>{{ step.title }}</strong><small>{{ step.label }}</small>{% if step.date %}<time datetime="{{ step.date.isoformat() }}Z" data-local-time>{{ step.date.strftime('%d %b %Y, %H:%M') }} UTC</time>{% endif %}</div>
+        </li>
+    {% endfor %}
+    </ol>
+    <small class="submission-updated">Last updated <time data-local-time datetime="{{ app_record.updated_at.isoformat() }}Z">{{ app_record.updated_at.strftime('%d %b %Y, %H:%M') }} UTC</time></small>
+</div>

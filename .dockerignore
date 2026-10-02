@@ -1,10 +1,12 @@
 .git
 .env
 .env.*
+deployment/.env.monitor
 !.env.example
 !.env.production.example
 env
 .venv
+node_modules
 instance
 __pycache__
 *.pyc
@@ -12,3 +14,8 @@ __pycache__
 *.log
 .ruff_cache
 backups
+test-accounts.txt
+_*test.py
+_*test.cjs
+package-lock.json
+design-system

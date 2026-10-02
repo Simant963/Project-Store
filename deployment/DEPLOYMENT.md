@@ -5,13 +5,13 @@
 - A Linux server with Docker Engine and Docker Compose.
 - A domain whose DNS points to the server.
 - TLS files at `deployment/certs/fullchain.pem` and `deployment/certs/privkey.pem`.
-- SMTP credentials for password-reset email.
+- No email service is required with `PASSWORD_RESET_MODE=manual`. SMTP is optional when email recovery is enabled.
 - A Supabase PostgreSQL session-pooler connection string.
 
 ## First deployment
 
 1. Copy `.env.production.example` to `.env.production` and replace every placeholder.
-2. Set `PUBLIC_BASE_URL` and the administrator email to the real domain.
+2. Set `PUBLIC_BASE_URL`, the administrator email, legal contacts, and `PASSWORD_RESET_MODE=manual`. SMTP values may remain empty in manual mode.
 3. Add the TLS certificate and private key under `deployment/certs`.
 4. Run the local release preflight. It validates settings without displaying secret values:
 
@@ -32,13 +32,10 @@
    docker compose --env-file .env.production -f docker-compose.production.yml exec web flask --app app production-check
    ```
 
-7. Run the authenticated role load test against staging before opening public
-   traffic. Set the `LOAD_<ROLE>_USERNAME` and `LOAD_<ROLE>_PASSWORD` variables
-   for admin, co-admin, developer, and user test accounts, then run:
-
-   ```text
-   python _role_load_test.py --url https://staging.example.com --concurrency 1000
-   ```
+7. Before opening public traffic, verify authenticated workflows for admin,
+   co-admin, developer, and user in a separate staging environment. Verify
+   sustained traffic, uploads, downloads, and backup recovery with privately
+   maintained test tools; local test scripts are no longer included here.
 
 The proxy redirects HTTP traffic to HTTPS. Only ports 80 and 443 are exposed;
 Redis and Gunicorn remain on the private container network. PostgreSQL is

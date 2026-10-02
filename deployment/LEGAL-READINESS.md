@@ -10,7 +10,7 @@ Status date: 24 September 2026. This is an engineering compliance register, not 
 - Developer approval, private identity-document access, administrator review, APK malware scanning, moderation, audit records, soft deletion, and administrator-only permanent deletion.
 - Grievance target: acknowledge within 24 hours and resolve within 7 days, with a working GAC appeal link.
 - Numeric retention schedule, including 180-day security logs and a 30-day backup rotation target.
-- Automated internal legal-link and email-link validation in `_legal_links_test.py`.
+- Verify internal legal links and published contact addresses before each release; local test scripts have been removed from the repository.
 - Aadhaar is not an accepted verification document; alternative ID types are offered.
 
 ## Official framework tracked

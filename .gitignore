@@ -9,7 +9,40 @@ instance/
 .env.*
 !.env.example
 !.env.production.example
+!deployment/.env.monitor.example
 backups/
 test-accounts.txt
+deployment/.env.monitor
 deployment/certs/*
 !deployment/certs/.gitkeep
+
+# Installed dependencies and local caches
+node_modules/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Private runtime data, credentials, and database exports
+*.log
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.dump
+*.sql.gz
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local test scripts and generated verification reports
+/_*test.py
+/_*test.cjs
+/tests/
+/test-results/
+/playwright-report/
+/reports/
+/deployment/PRODUCTION-TEST-REPORT.md
+/deployment/PERFORMANCE-BASELINE.md
+/design-system/UI-QA.md

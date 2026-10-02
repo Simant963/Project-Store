@@ -51,6 +51,8 @@ from .models import (
     DownloadRecord,
     GovernmentIdType,
     LoginThrottle,
+    ManualPasswordReset,
+    ManualResetStatus,
     MarketplaceSettings,
     Notification,
     NotificationType,
@@ -59,6 +61,7 @@ from .models import (
     ReportStatus,
     ReleaseStatus,
     SecurityScanStatus,
+    SubmissionStatus,
     SavedApp,
     SecurityQuestion,
     ReviewStatus,
@@ -67,6 +70,7 @@ from .models import (
     UserRole,
 )
 from .realtime import account_events
+from .submission_workflow import set_status, start_submission, submission_view
 from .username_linked_list import username_index
 
 main = Blueprint("main", __name__)
@@ -261,6 +265,33 @@ def issue_password_reset(user):
     )
     db.session.commit()
     return raw_token
+
+
+def create_manual_reset_request(user):
+    """Create one pending request per account and invalidate older requests."""
+    now = datetime.now(timezone.utc)
+    ManualPasswordReset.query.filter(
+        ManualPasswordReset.user_id == user.id,
+        ManualPasswordReset.status.in_([
+            ManualResetStatus.PENDING,
+            ManualResetStatus.APPROVED,
+        ]),
+    ).update(
+        {
+            "status": ManualResetStatus.REJECTED,
+            "reviewed_at": now,
+            "code_hash": None,
+            "code_expires_at": None,
+        },
+        synchronize_session=False,
+    )
+    reference = secrets.token_hex(6).upper()
+    while ManualPasswordReset.query.filter_by(reference=reference).first():
+        reference = secrets.token_hex(6).upper()
+    reset_request = ManualPasswordReset(user_id=user.id, reference=reference)
+    db.session.add(reset_request)
+    db.session.commit()
+    return reset_request
 
 
 def role_required(required_role):
@@ -944,6 +975,10 @@ def forgot_password():
     )
     if requested_role not in {UserRole.USER.value, UserRole.DEVELOPER.value}:
         requested_role = UserRole.USER.value
+    if current_app.config.get("PASSWORD_RESET_MODE", "manual") == "manual":
+        return redirect(
+            url_for("main.security_question_recovery", role=requested_role)
+        )
     request_sent = False
     if request.method == "POST":
         if not valid_csrf_token():
@@ -1021,8 +1056,14 @@ def security_question_recovery():
                 and answer_matches
             ):
                 clear_login_failures(scope, identifier)
-                token = issue_password_reset(user)
-                return redirect(url_for("main.reset_password", token=token))
+                reset_request = create_manual_reset_request(user)
+                return render_template(
+                    "password_recovery.html",
+                    mode="manual_requested",
+                    reset_reference=reset_request.reference,
+                    recovery_role=role_value,
+                    csrf_token=get_csrf_token(),
+                )
             record_login_failure(scope, identifier)
         flash("Those recovery details could not be verified.", "error")
     return render_template(
@@ -1030,6 +1071,63 @@ def security_question_recovery():
         mode="security_question",
         recovery_role=role_value,
         security_questions=SecurityQuestion,
+        email_recovery_enabled=current_app.config.get("PASSWORD_RESET_MODE")
+        == "email",
+        csrf_token=get_csrf_token(),
+    )
+
+
+@main.route("/manual-password-reset", methods=["GET", "POST"])
+def manual_password_reset():
+    if request.method == "POST":
+        if not valid_csrf_token():
+            abort(400)
+        reference = re.sub(r"[^A-Fa-f0-9]", "", request.form.get("reference", ""))[
+            :24
+        ].upper()
+        code = re.sub(r"\D", "", request.form.get("code", ""))[:8]
+        scope = f"manual-reset-{reference}"
+        reset_request = ManualPasswordReset.query.filter_by(reference=reference).first()
+        supplied_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        stored_hash = reset_request.code_hash if reset_request else "0" * 64
+        valid_code = secrets.compare_digest(stored_hash or "0" * 64, supplied_hash)
+        if (
+            reset_request
+            and reset_request.code_is_valid
+            and not login_is_throttled(scope, reference)
+            and valid_code
+            and reset_request.user.status
+            not in {AccountStatus.BLOCKED, AccountStatus.DELETED}
+        ):
+            now = datetime.now(timezone.utc)
+            reset_request.status = ManualResetStatus.USED
+            reset_request.used_at = now
+            reset_request.code_hash = None
+            if reset_request.reviewed_by:
+                record_admin_audit(
+                    reset_request.reviewed_by,
+                    AuditAction.PASSWORD_RECOVERY,
+                    "redeem",
+                    "manual_password_reset",
+                    reset_request.id,
+                    reset_request.reference,
+                    f"One-time reset code redeemed for user ID {reset_request.user_id}.",
+                )
+            token = issue_password_reset(reset_request.user)
+            clear_login_failures(scope, reference)
+            return redirect(url_for("main.reset_password", token=token))
+        if reset_request and reset_request.status == ManualResetStatus.APPROVED:
+            reset_request.failed_attempts += 1
+            if reset_request.failed_attempts >= 5:
+                reset_request.status = ManualResetStatus.REJECTED
+                reset_request.code_hash = None
+            db.session.commit()
+        record_login_failure(scope, reference)
+        flash("The reference or code is invalid, expired, or not approved.", "error")
+    return render_template(
+        "password_recovery.html",
+        mode="manual_code",
+        reference=request.args.get("reference", "")[:24],
         csrf_token=get_csrf_token(),
     )
 
@@ -1454,7 +1552,7 @@ def submit_app(user, app_id=None):
         app_record = db.session.get(StoreApp, app_id)
         if app_record is None or app_record.developer_id != user.id:
             abort(404)
-        if app_record.status != AppStatus.REJECTED:
+        if app_record.status not in {AppStatus.REJECTED, AppStatus.PENDING} or app_record.submission_status not in {SubmissionStatus.ADMIN_REJECTED, SubmissionStatus.SECURITY_CHECK_FAILED}:
             flash("Only rejected submissions can be edited and resubmitted.", "warning")
             return redirect(url_for("main.developer_dashboard"))
 
@@ -1683,6 +1781,7 @@ def submit_app(user, app_id=None):
             app_record.review_note = None
             app_record.submitted_at = datetime.now(timezone.utc)
             app_record.approved_at = None
+            start_submission(app_record, user)
             if new_screenshots:
                 app_record.screenshots.clear()
                 app_record.screenshots.extend(
@@ -1749,7 +1848,7 @@ def submit_app_version(user, app_id):
             "warning",
         )
         return redirect(url_for("main.developer_dashboard"))
-    if app_record.pending_release_status == ReleaseStatus.PENDING:
+    if app_record.pending_release_status == ReleaseStatus.PENDING and app_record.submission_status != SubmissionStatus.SECURITY_CHECK_FAILED:
         flash(
             "This app already has a version waiting for administrator review.",
             "warning",
@@ -1868,6 +1967,7 @@ def submit_app_version(user, app_id):
             app_record.pending_release_status = ReleaseStatus.PENDING
             app_record.pending_release_note = None
             app_record.pending_release_submitted_at = datetime.now(timezone.utc)
+            start_submission(app_record, user)
             db.session.commit()
             if old_pending_apk and old_pending_apk != apk_file:
                 safe_delete_upload("apks", old_pending_apk)
@@ -1986,9 +2086,13 @@ def app_detail(slug):
 
 @main.get("/apps/<slug>/download")
 def download_app(slug):
-    app_record = StoreApp.query.filter_by(
-        slug=slug, status=AppStatus.APPROVED
-    ).first_or_404()
+    # Serialize tracking for this app so concurrent first downloads cannot
+    # duplicate user/version records or lose increments on PostgreSQL.
+    app_record = (
+        StoreApp.query.filter_by(slug=slug, status=AppStatus.APPROVED)
+        .with_for_update()
+        .first_or_404()
+    )
     apk_path = private_upload_folder("apks") / app_record.apk_file
     if not apk_path.is_file():
         abort(404)
@@ -2221,6 +2325,9 @@ def admin_dashboard(admin):
     return render_template(
         "admin_dashboard.html",
         admin=admin,
+        submissions=StoreApp.query.options(joinedload(StoreApp.developer)).filter(
+            StoreApp.status != AppStatus.DELETED
+        ).order_by(StoreApp.updated_at.desc()).limit(5).all(),
         accounts=accounts,
         counts=counts,
         role_filter=role_filter,
@@ -2249,6 +2356,85 @@ def admin_developer_review(admin, user_id):
         developer=developer,
         profile=developer.developer_profile,
         marketplace_settings=marketplace_settings(),
+        csrf_token=get_csrf_token(),
+    )
+
+
+@main.route("/admin/password-resets", methods=["GET", "POST"])
+@role_required(UserRole.ADMIN)
+def admin_password_resets(admin):
+    issued_code = None
+    issued_reference = None
+    if request.method == "POST":
+        if not valid_csrf_token():
+            abort(400)
+        reset_request = db.session.get(
+            ManualPasswordReset, request.form.get("request_id", type=int)
+        )
+        action = request.form.get("action", "")
+        admin_password = request.form.get("admin_password", "")
+        if reset_request is None:
+            abort(404)
+        if reset_request.status != ManualResetStatus.PENDING:
+            flash("That request has already been reviewed.", "error")
+        elif not admin.check_password(admin_password):
+            flash("Your administrator password was incorrect.", "error")
+        elif action == "approve":
+            raw_code = f"{secrets.randbelow(100_000_000):08d}"
+            reset_request.status = ManualResetStatus.APPROVED
+            reset_request.code_hash = hashlib.sha256(
+                raw_code.encode("utf-8")
+            ).hexdigest()
+            reset_request.code_expires_at = datetime.now(timezone.utc) + timedelta(
+                minutes=15
+            )
+            reset_request.failed_attempts = 0
+            reset_request.reviewed_by_id = admin.id
+            reset_request.reviewed_at = datetime.now(timezone.utc)
+            record_admin_audit(
+                admin,
+                AuditAction.PASSWORD_RECOVERY,
+                "approve",
+                "manual_password_reset",
+                reset_request.id,
+                reset_request.reference,
+                f"Approved password reset for user ID {reset_request.user_id}.",
+            )
+            db.session.commit()
+            issued_code = raw_code
+            issued_reference = reset_request.reference
+        elif action == "reject":
+            reset_request.status = ManualResetStatus.REJECTED
+            reset_request.reviewed_by_id = admin.id
+            reset_request.reviewed_at = datetime.now(timezone.utc)
+            reset_request.code_hash = None
+            reset_request.code_expires_at = None
+            record_admin_audit(
+                admin,
+                AuditAction.PASSWORD_RECOVERY,
+                "reject",
+                "manual_password_reset",
+                reset_request.id,
+                reset_request.reference,
+                f"Rejected password reset for user ID {reset_request.user_id}.",
+            )
+            db.session.commit()
+            flash("The password-reset request was rejected.", "success")
+        else:
+            abort(400)
+
+    requests = (
+        ManualPasswordReset.query.options(joinedload(ManualPasswordReset.user))
+        .order_by(ManualPasswordReset.created_at.desc())
+        .limit(100)
+        .all()
+    )
+    return render_template(
+        "admin_password_resets.html",
+        admin=admin,
+        reset_requests=requests,
+        issued_code=issued_code,
+        issued_reference=issued_reference,
         csrf_token=get_csrf_token(),
     )
 
@@ -2657,15 +2843,28 @@ def admin_apps(admin):
                 StoreApp.pending_release_status == ReleaseStatus.PENDING,
             )
         )
-    elif status_value in {status.value for status in AppStatus}:
+    elif status_value in {status.value for status in AppStatus} and status_value != "rejected":
         apps_query = apps_query.filter(StoreApp.status == AppStatus(status_value))
+    elif status_value in {
+        "security_failed", "waiting_review", "verified", "published", "rejected"
+    }:
+        workflow_filters = {
+            "security_failed": SubmissionStatus.SECURITY_CHECK_FAILED,
+            "waiting_review": SubmissionStatus.ADMIN_REVIEW_PENDING,
+            "verified": SubmissionStatus.PUBLISH_PENDING,
+            "published": SubmissionStatus.PUBLISHED,
+            "rejected": SubmissionStatus.ADMIN_REJECTED,
+        }
+        apps_query = apps_query.filter(StoreApp.submission_status == workflow_filters[status_value])
     if query_text:
         search = f"%{escaped_search_term(query_text)}%"
-        apps_query = apps_query.join(User).filter(
+        apps_query = apps_query.join(User, StoreApp.developer_id == User.id).filter(
             or_(
                 func.lower(StoreApp.name).like(search, escape="\\"),
                 func.lower(StoreApp.package_name).like(search, escape="\\"),
                 func.lower(User.username).like(search, escape="\\"),
+                func.lower(User.company_name).like(search, escape="\\"),
+                StoreApp.id == (int(query_text) if query_text.isdecimal() else -1),
             )
         )
     pagination = apps_query.order_by(
@@ -2717,67 +2916,141 @@ def admin_app_review(admin, app_id):
     )
 
 
+@main.get("/developer/apps/<int:app_id>")
+@developer_access_required
+def developer_app_submission(user, app_id):
+    app_record = StoreApp.query.filter_by(id=app_id, developer_id=user.id).first_or_404()
+    return render_template("developer_app_submission.html", user=user,
+        app_record=app_record, csrf_token=get_csrf_token())
+
+
+def submission_reader():
+    user = current_user()
+    if not user or user.status in {AccountStatus.BLOCKED, AccountStatus.DELETED}:
+        abort(401)
+    if user.role in {UserRole.ADMIN, UserRole.CO_ADMIN} and user.status == AccountStatus.APPROVED:
+        return user, StoreApp.query
+    if user.role == UserRole.DEVELOPER:
+        return user, StoreApp.query.filter_by(developer_id=user.id)
+    abort(403)
+
+
+@main.get("/submission-status")
+def submission_status_snapshot():
+    user, query = submission_reader()
+    ids = [int(value) for value in request.args.get("ids", "").split(",") if value.isdecimal()][:50]
+    apps = query.filter(StoreApp.id.in_(ids)).all()
+    items = []
+    for app_record in apps:
+        view = submission_view(app_record)
+        items.append({"id": app_record.id, "revision": app_record.submission_revision,
+            "label": view["label"], "security": view["security"], "admin": view["admin"],
+            "publishing": view["publishing"],
+            "html": render_template("_submission_progress.html", app_record=app_record),
+            "panel": render_template("_submission_panel.html", app_record=app_record,
+                admin=user if user.role in {UserRole.ADMIN, UserRole.CO_ADMIN} else None,
+                csrf_token=get_csrf_token()) if request.args.get("details") == "1" else None})
+    response = jsonify({"items": items})
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
+@main.get("/apps/<int:app_id>/status-history")
+def app_submission_history(app_id):
+    user, query = submission_reader()
+    app_record = query.filter_by(id=app_id).first_or_404()
+    response = jsonify({"history": [{"previousStatus": entry.previous_status,
+        "newStatus": entry.new_status, "changedBy": entry.changed_by_id,
+        "changedByRole": entry.changed_by_role, "reason": entry.reason,
+        "version": entry.version, "createdAt": entry.created_at.isoformat()}
+        for entry in app_record.submission_history]})
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
 @main.post("/admin/apps/<int:app_id>/scan")
 @staff_required
 def scan_app(admin, app_id):
     if not valid_csrf_token():
         abort(400)
-    app_record = db.session.get(StoreApp, app_id)
+    app_record = StoreApp.query.filter_by(id=app_id).with_for_update().populate_existing().first()
     if app_record is None:
         abort(404)
-    target_name = request.form.get("target", "current")
-    if target_name not in {"current", "pending"}:
-        abort(400)
-    pending = target_name == "pending"
-    filename = app_record.pending_apk_file if pending else app_record.apk_file
-    if not filename or Path(filename).name != filename:
-        abort(404)
-    directory = private_upload_folder("apks")
-    path = (directory / filename).resolve()
-    if path.parent != directory or not path.is_file():
-        abort(404)
-
+    target_name = request.form.get("target", "pending" if app_record.pending_version else "current")
+    pending = bool(app_record.pending_version)
+    if target_name != ("pending" if pending else "current") or app_record.status in {AppStatus.DELETED, AppStatus.BLOCKED}:
+        abort(409, description="Scan the current submission, not a previous live build.")
+    if app_record.submission_status not in {SubmissionStatus.SECURITY_CHECK_PENDING, SubmissionStatus.SECURITY_CHECK_FAILED}:
+        abort(409, description="This build has already left the security stage.")
+    started = app_record.scan_started_at
     now = datetime.now(timezone.utc)
-    try:
-        report = deep_scan_apk(path)
-        structural_status = (
-            SecurityScanStatus.PASSED
-            if report["failed"] == 0
-            else SecurityScanStatus.FAILED
-        )
-        structural_summary = json.dumps(report, separators=(",", ":"))
-    except (OSError, ValueError, zipfile.BadZipFile) as error:
-        structural_status = SecurityScanStatus.FAILED
-        structural_summary = str(error) or "The APK could not be statically analyzed."
-
-    try:
-        malware_summary = scan_apk_for_malware(path)
-        malware_status = SecurityScanStatus.PASSED
-    except ValueError as error:
-        malware_summary = str(error)
-        malware_status = SecurityScanStatus.FAILED
-
-    prefix = "pending_" if pending else ""
-    setattr(app_record, f"{prefix}security_scan_status", structural_status)
-    setattr(app_record, f"{prefix}security_scan_summary", structural_summary)
-    setattr(app_record, f"{prefix}security_scanned_at", now)
-    setattr(app_record, f"{prefix}malware_scan_status", malware_status)
-    setattr(app_record, f"{prefix}malware_scan_summary", malware_summary)
-    setattr(app_record, f"{prefix}malware_scanned_at", now)
-    record_admin_audit(
-        admin,
-        AuditAction.APP_MODERATION,
-        "security_scan",
-        "release" if pending else "app",
-        app_record.id,
-        app_record.name,
-        f"{target_name}: static={structural_status.value}, malware={malware_status.value}",
-    )
+    if started and now - started.replace(tzinfo=timezone.utc) < timedelta(minutes=10):
+        abort(409, description="A security scan is already running. Please wait.")
+    if app_record.submission_status == SubmissionStatus.SECURITY_CHECK_FAILED:
+        set_status(app_record, SubmissionStatus.SECURITY_CHECK_PENDING, admin, "Security scan retried")
+    app_record.scan_started_at = now
+    filename = app_record.pending_apk_file if pending else app_record.apk_file
+    expected_digest = app_record.pending_apk_sha256 if pending else app_record.apk_sha256
+    directory = private_upload_folder("apks")
+    path = (directory / filename).resolve() if filename else directory
     db.session.commit()
-    if structural_status == SecurityScanStatus.PASSED and malware_status == SecurityScanStatus.PASSED:
-        flash("Security scan completed. Review any warnings before approval.", "success")
+    account_events.publish({"type": "app_scan_started", "app_id": app_id,
+        "user_id": app_record.developer_id})
+    structural_summary = malware_summary = "The application file is missing or invalid."
+    structural_status = malware_status = SecurityScanStatus.FAILED
+    try:
+        if not filename or Path(filename).name != filename or path.parent != directory or not path.is_file():
+            raise ValueError(structural_summary)
+        with path.open("rb") as uploaded:
+            digest = hashlib.file_digest(uploaded, "sha256").hexdigest()
+        if digest != expected_digest:
+            raise ValueError("The application file changed after submission.")
+        report = deep_scan_apk(path)
+        structural_status = SecurityScanStatus.PASSED if report["failed"] == 0 else SecurityScanStatus.FAILED
+        structural_summary = json.dumps(report, separators=(",", ":"))
+        try:
+            malware_summary = scan_apk_for_malware(path)
+            malware_status = SecurityScanStatus.PASSED
+        except ValueError as error:
+            malware_summary = str(error)
+    except (OSError, ValueError, zipfile.BadZipFile) as error:
+        structural_summary = str(error) or "Invalid application package."
+    # Reload under lock so edits/download counters during the scan are not overwritten.
+    app_record = StoreApp.query.filter_by(id=app_id).with_for_update().populate_existing().first()
+    if app_record is None or app_record.scan_started_at is None or app_record.scan_started_at.replace(tzinfo=timezone.utc) != now:
+        abort(409, description="The submission changed while the scan was running.")
+    if app_record.status in {AppStatus.DELETED, AppStatus.BLOCKED}:
+        app_record.scan_started_at = None
+        db.session.commit()
+        abort(409)
+    prefix = "pending_" if pending else ""
+    finished = datetime.now(timezone.utc)
+    for field, value in {"security_scan_status": structural_status,
+        "security_scan_summary": structural_summary, "security_scanned_at": finished,
+        "malware_scan_status": malware_status, "malware_scan_summary": malware_summary,
+        "malware_scanned_at": finished}.items():
+        setattr(app_record, prefix + field, value)
+    app_record.scan_started_at = None
+    passed = structural_status == malware_status == SecurityScanStatus.PASSED
+    if passed:
+        set_status(app_record, SubmissionStatus.SECURITY_CHECK_PASSED, reason="Static APK checks and ClamAV malware scan passed")
+        set_status(app_record, SubmissionStatus.ADMIN_REVIEW_PENDING, reason="Waiting for an administrator to verify this build")
+        app_record.submission_feedback = None
     else:
-        flash("Security scan found a failure. This build cannot be approved.", "error")
+        reasons = []
+        if structural_status == SecurityScanStatus.FAILED:
+            parsed = parse_deep_scan_report(structural_summary)
+            reasons.append("; ".join(check["name"] + ": " + check["detail"] for check in parsed["checks"] if check["status"] == "fail") if parsed else structural_summary)
+        if malware_status == SecurityScanStatus.FAILED:
+            reasons.append(malware_summary)
+        app_record.submission_feedback = "\n".join(reasons)[:4000]
+        set_status(app_record, SubmissionStatus.SECURITY_CHECK_FAILED, reason=app_record.submission_feedback)
+    record_admin_audit(admin, AuditAction.APP_MODERATION, "security_scan", "release" if pending else "app",
+        app_id, app_record.name, f"{target_name}: static={structural_status.value}, malware={malware_status.value}")
+    db.session.commit()
+    account_events.publish({"type": "app_scan_completed", "app_id": app_id,
+        "user_id": app_record.developer_id, "submission_status": app_record.submission_status.value})
+    flash("Security checks passed; awaiting admin verification." if passed else "Security check failed. Review the failure reason.", "success" if passed else "error")
     return redirect(url_for("main.admin_app_review", app_id=app_id))
 
 
@@ -2887,124 +3160,119 @@ def admin_download_pending_apk(admin, app_id):
     )
 
 
+def publish_submission_build(app_record):
+    if app_record.pending_version:
+        db.session.add(AppVersionHistory(app=app_record, version=app_record.version,
+            min_android_version=app_record.min_android_version, changelog=app_record.changelog,
+            apk_file=app_record.apk_file, apk_original_name=app_record.apk_original_name,
+            apk_size=app_record.apk_size, apk_sha256=app_record.apk_sha256,
+            published_at=app_record.approved_at or app_record.created_at))
+        for field in ("version", "min_android_version", "changelog", "apk_file",
+                      "apk_original_name", "apk_size", "apk_sha256", "security_scan_status",
+                      "security_scan_summary", "security_scanned_at", "malware_scan_status",
+                      "malware_scan_summary", "malware_scanned_at"):
+            setattr(app_record, field, getattr(app_record, "pending_" + field))
+        app_record.clear_pending_release()
+    app_record.approve()
+    app_record.published_at = datetime.now(timezone.utc)
+
+
+def perform_submission_action(admin, app_id, action):
+    if not valid_csrf_token():
+        abort(400, description="Your session expired. Refresh and try again.")
+    app_record = StoreApp.query.filter_by(id=app_id).with_for_update().populate_existing().first()
+    if app_record is None:
+        abort(404)
+    if app_record.status in {AppStatus.DELETED, AppStatus.BLOCKED}:
+        abort(409, description="Restore or unblock this app through moderation first.")
+    state = app_record.submission_status
+    if (action == "publish" and state == SubmissionStatus.PUBLISHED) or (
+        action == "approve" and state in {SubmissionStatus.ADMIN_VERIFIED, SubmissionStatus.PUBLISH_PENDING, SubmissionStatus.PUBLISHED}
+    ):
+        return jsonify({"ok": True, "unchanged": True, "status": submission_view(app_record)}) if request.headers.get("X-Requested-With") == "fetch" else redirect(url_for("main.admin_app_review", app_id=app_id))
+    revision = request.form.get("revision", type=int)
+    if revision is not None and revision != app_record.submission_revision:
+        abort(409, description="Another reviewer changed this submission. Refresh before continuing.")
+    note = request.form.get("review_note", "").strip()
+    if len(note) > 4000:
+        abort(400, description="Feedback must be at most 4,000 characters.")
+    try:
+        if action in {"approve", "publish"}:
+            if app_record.developer.status != AccountStatus.APPROVED:
+                raise ValueError("The developer must be approved before verification or publication.")
+            prefix = "pending_" if app_record.pending_version else ""
+            if not deep_scan_passed(getattr(app_record, prefix + "security_scan_summary")) or getattr(app_record, prefix + "malware_scan_status") != SecurityScanStatus.PASSED:
+                raise ValueError("Run the administrator security scan; both static and malware checks must pass.")
+            filename = getattr(app_record, prefix + "apk_file")
+            path = private_upload_folder("apks") / filename
+            digest = None
+            if path.is_file() and Path(filename).name == filename:
+                with path.open("rb") as uploaded:
+                    digest = hashlib.file_digest(uploaded, "sha256").hexdigest()
+            if digest != getattr(app_record, prefix + "apk_sha256"):
+                raise ValueError("The scanned APK is missing or has changed. Resubmit and scan the build again.")
+            if action == "approve":
+                set_status(app_record, SubmissionStatus.ADMIN_VERIFIED, admin, note or "Administrator verified this build")
+                app_record.verified_at = datetime.now(timezone.utc)
+                app_record.verified_by_id = admin.id
+                app_record.submission_feedback = note or None
+                set_status(app_record, SubmissionStatus.PUBLISH_PENDING, reason="Awaiting explicit publication")
+            else:
+                set_status(app_record, SubmissionStatus.PUBLISHED, admin, "Application is now live")
+                publish_submission_build(app_record)
+                for (saved_user_id,) in db.session.query(SavedApp.user_id).filter_by(app_id=app_id).all():
+                    create_notification(saved_user_id, NotificationType.RELEASE,
+                        f"{app_record.name} {app_record.version} is available",
+                        "An administrator-approved release is ready to download.",
+                        url_for("main.app_detail", slug=app_record.slug))
+        elif action in {"reject", "request-changes"}:
+            if not note:
+                raise ValueError("A reason is required for rejection or requested changes.")
+            set_status(app_record, SubmissionStatus.ADMIN_REJECTED, admin, note)
+            app_record.submission_feedback = note
+            app_record.changes_requested = action == "request-changes"
+            if app_record.pending_version:
+                app_record.pending_release_status = ReleaseStatus.REJECTED
+                app_record.pending_release_note = note
+            else:
+                app_record.reject(note)
+        else:
+            abort(404)
+    except ValueError as error:
+        db.session.rollback()
+        if request.headers.get("X-Requested-With") == "fetch":
+            return jsonify({"ok": False, "message": str(error)}), 409
+        flash(str(error), "error")
+        return redirect(url_for("main.admin_app_review", app_id=app_id))
+    record_admin_audit(admin, AuditAction.APP_MODERATION, action, "app", app_id, app_record.name, note)
+    db.session.commit()
+    account_events.publish({"type": "app_updated", "app_id": app_id,
+        "user_id": app_record.developer_id, "status": app_record.status.value,
+        "submission_status": app_record.submission_status.value})
+    if request.headers.get("X-Requested-With") == "fetch":
+        return jsonify({"ok": True, "status": submission_view(app_record)})
+    flash("Submission updated: " + submission_view(app_record)["label"], "success")
+    return redirect(url_for("main.admin_app_review", app_id=app_id))
+
+
 @main.post("/admin/apps/<int:app_id>/release/<action>")
 @staff_required
 def manage_app_release(admin, app_id, action):
-    if not valid_csrf_token():
-        flash("Your session expired. Please try again.", "error")
-        return redirect(url_for("main.admin_apps"))
-    app_record = db.session.get(StoreApp, app_id)
-    if app_record is None or app_record.pending_release_status is None:
-        abort(404)
-    if action not in {"approve", "reject"}:
-        abort(404)
-
-    version = app_record.pending_version
-    if action == "approve":
-        if app_record.pending_release_status != ReleaseStatus.PENDING:
-            flash("Only a pending version can be approved.", "error")
-            return redirect(url_for("main.admin_app_review", app_id=app_id))
-        if not deep_scan_passed(app_record.pending_security_scan_summary):
-            flash(
-                "Run the 60-point administrator security scan before approval.",
-                "error",
-            )
-            return redirect(url_for("main.admin_app_review", app_id=app_id))
-        if app_record.pending_malware_scan_status != SecurityScanStatus.PASSED:
-            flash("This version must pass malware scanning before approval.", "error")
-            return redirect(url_for("main.admin_app_review", app_id=app_id))
-        previous = AppVersionHistory(
-            app=app_record,
-            version=app_record.version,
-            min_android_version=app_record.min_android_version,
-            changelog=app_record.changelog,
-            apk_file=app_record.apk_file,
-            apk_original_name=app_record.apk_original_name,
-            apk_size=app_record.apk_size,
-            apk_sha256=app_record.apk_sha256,
-            published_at=app_record.approved_at or app_record.created_at,
-        )
-        db.session.add(previous)
-        app_record.version = app_record.pending_version
-        app_record.min_android_version = app_record.pending_min_android_version
-        app_record.changelog = app_record.pending_changelog
-        app_record.apk_file = app_record.pending_apk_file
-        app_record.apk_original_name = app_record.pending_apk_original_name
-        app_record.apk_size = app_record.pending_apk_size
-        app_record.apk_sha256 = app_record.pending_apk_sha256
-        app_record.security_scan_status = app_record.pending_security_scan_status
-        app_record.security_scan_summary = app_record.pending_security_scan_summary
-        app_record.security_scanned_at = app_record.pending_security_scanned_at
-        app_record.malware_scan_status = app_record.pending_malware_scan_status
-        app_record.malware_scan_summary = app_record.pending_malware_scan_summary
-        app_record.malware_scanned_at = app_record.pending_malware_scanned_at
-        app_record.approved_at = datetime.now(timezone.utc)
-        app_record.clear_pending_release()
-        message = f"Version {version} of {app_record.name} was published."
-        status_value = "approved"
-    else:
-        note = request.form.get("review_note", "").strip()
-        app_record.pending_release_status = ReleaseStatus.REJECTED
-        app_record.pending_release_note = note or "This version was not approved."
-        message = f"Version {version} of {app_record.name} was rejected."
-        status_value = "rejected"
-
-    create_notification(
-        app_record.developer_id,
-        NotificationType.RELEASE,
-        f"{app_record.name} version {version} {status_value}",
-        message,
-        url_for("main.developer_dashboard"),
-    )
-    if action == "approve":
-        saved_user_ids = (
-            db.session.query(SavedApp.user_id).filter_by(app_id=app_id).all()
-        )
-        for (saved_user_id,) in saved_user_ids:
-            create_notification(
-                saved_user_id,
-                NotificationType.RELEASE,
-                f"{app_record.name} {version} is available",
-                "A new administrator-approved version is ready to download.",
-                url_for("main.app_detail", slug=app_record.slug),
-            )
-    record_admin_audit(
-        admin,
-        AuditAction.RELEASE_MODERATION,
-        action,
-        "release",
-        app_id,
-        f"{app_record.name} v{version}",
-        request.form.get("review_note", "").strip(),
-    )
-    db.session.commit()
-    event = account_events.publish(
-        {
-            "type": "release_updated",
-            "action": action,
-            "app_id": app_record.id,
-            "user_id": app_record.developer_id,
-            "name": app_record.name,
-            "version": version,
-            "status": status_value,
-        }
-    )
-    if request.headers.get("X-Requested-With") == "fetch":
-        return jsonify({"ok": True, "message": message, "event": event})
-    flash(message, "success")
-    return redirect(url_for("main.admin_app_review", app_id=app_id))
+    return perform_submission_action(admin, app_id, action)
 
 
 @main.post("/admin/apps/<int:app_id>/<action>")
 @staff_required
 def manage_app(admin, app_id, action):
+    if action in {"approve", "reject", "request-changes", "publish"}:
+        return perform_submission_action(admin, app_id, action)
     if not valid_csrf_token():
         flash("Your session expired. Please try again.", "error")
         return redirect(url_for("main.admin_apps"))
-    app_record = db.session.get(StoreApp, app_id)
+    app_record = StoreApp.query.filter_by(id=app_id).with_for_update().populate_existing().first()
     if app_record is None:
         abort(404)
-    if action not in {"approve", "reject", "block", "delete", "restore", "hard_delete"}:
+    if action not in {"block", "delete", "restore", "hard_delete"}:
         abort(404)
     if admin.role == UserRole.CO_ADMIN and action not in {"approve", "reject"}:
         abort(403)
@@ -3021,25 +3289,8 @@ def manage_app(admin, app_id, action):
         )
         if confirmation:
             return confirmation
-    if action == "approve" and app_record.developer.status != AccountStatus.APPROVED:
-        flash("Approve the developer account before approving this app.", "error")
-        return redirect(url_for("main.admin_app_review", app_id=app_id))
-    if (
-        action == "approve"
-        and not deep_scan_passed(app_record.security_scan_summary)
-    ):
-        flash("Run the 60-point administrator security scan before approval.", "error")
-        return redirect(url_for("main.admin_app_review", app_id=app_id))
-    if (
-        action == "approve"
-        and app_record.malware_scan_status != SecurityScanStatus.PASSED
-    ):
-        flash("This APK must pass malware scanning before approval.", "error")
-        return redirect(url_for("main.admin_app_review", app_id=app_id))
 
     action_labels = {
-        "approve": "approved",
-        "reject": "rejected",
         "block": "blocked",
         "delete": "moved to trash",
         "restore": "restored",
@@ -3050,11 +3301,7 @@ def manage_app(admin, app_id, action):
     app_name = app_record.name
     developer_id = app_record.developer_id
     cleanup_files = []
-    if action == "approve":
-        app_record.approve()
-    elif action == "reject":
-        app_record.reject(review_note)
-    elif action == "block":
+    if action == "block":
         app_record.block(review_note)
     elif action == "delete":
         app_record.soft_delete(review_note)
@@ -3608,7 +3855,8 @@ def developer_dashboard(user):
             .all()
         )
         downloads_by_day = {
-            datetime.strptime(day, "%Y-%m-%d").date(): count for day, count in tracked
+            datetime.strptime(str(day), "%Y-%m-%d").date(): count
+            for day, count in tracked
         }
         seven_day_downloads = [
             {

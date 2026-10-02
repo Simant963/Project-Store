@@ -16,7 +16,7 @@ The default local database is SQLite. Uploaded identity documents, screenshots, 
 
 - Use PostgreSQL by setting `DATABASE_URL`, run `flask --app app db upgrade` as a deployment/release step, and run the site with the included `Procfile`.
 - Set `APP_ENV=production`, `FLASK_DEBUG=false`, `SESSION_COOKIE_SECURE=true`, `TRUST_PROXY=true`, and a unique high-entropy `SECRET_KEY`. Startup rejects unsafe production values.
-- Set `PUBLIC_BASE_URL` to the HTTPS domain and configure all SMTP values so password-reset links are emailed.
+- Set `PASSWORD_RESET_MODE=manual` for administrator-approved recovery without an email service. Use `email` and configure SMTP only if emailed reset links are wanted.
 - Mount durable private storage or replace local uploads with private object storage. The web filesystem must not be ephemeral.
 - Back up the database and private uploads together, and test restoration before launch.
 - Appora tracks schema revisions with Alembic's `alembic_version` table. Review generated migrations, back up production, and apply `flask --app app db upgrade` before starting a new release.
@@ -34,7 +34,7 @@ Required production services:
 - Supabase PostgreSQL through its session-pooler `DATABASE_URL`.
 - Redis through `REDIS_URL` for live updates across web workers.
 - A persistent mounted disk for `PRIVATE_UPLOAD_ROOT`.
-- An SMTP provider for password-reset messages.
+- No mail service is required in manual reset mode. An SMTP provider is optional for emailed reset links.
 - ClamAV installed in the application image with current signatures.
 - An HTTPS reverse proxy with `TRUST_PROXY=true`.
 
@@ -59,32 +59,19 @@ commands, follow `deployment/DEPLOYMENT.md` and use
 Before a release, create the private `.env.production` file and TLS files, then
 run `powershell -NoProfile -ExecutionPolicy Bypass -File deployment/preflight.ps1`.
 The checker does not display
-secret values and fails when required configuration, certificates, regression
-tests, migrations, Docker, or the Compose configuration are not ready.
+secret values and fails when required configuration, certificates,
+migrations, Docker, or the Compose configuration are not ready.
 
 ## Verification
 
-Run the two regression scripts:
+Local test scripts, saved test credentials, and generated verification reports
+have been removed from this repository. Before launch, verify registration,
+login, password recovery, developer/app approvals, uploads, downloads, role
+permissions, malware rejection, and backup recovery in a separate staging
+environment. Check `/health` and `/ready` after every deployment.
 
-```text
-python _apk_security_test.py
-python _marketplace_workflow_test.py
-```
-
-They use isolated temporary databases and do not alter local marketplace data.
-
-After staging is deployed, set the eight `LOAD_<ROLE>_USERNAME` and
-`LOAD_<ROLE>_PASSWORD` environment variables for the four test accounts, then
-verify a 1,000-request wave per role with:
-
-```text
-python _role_load_test.py --url https://staging.example.com --concurrency 1000
-```
-
-The suites cover registration and login flows, password recovery, downloads,
-reviews and reports, developer/app approvals, admin and co-admin permission
-boundaries, APK structure and malware rejection, soft deletion and restore,
-protected permanent deletion, realtime state changes, and logout confirmation.
+Keep private environment files, runtime data, backups, and installed
+dependencies out of Git. Only placeholder environment examples are committed.
 
 ## Database migrations
 
