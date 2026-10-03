@@ -1,0 +1,17 @@
+{% set progress = submission_view(app_record) %}
+<a class="review-button"
+    href="{{ url_for('main.developer_app_submission', app_id=app_record.id) }}">View
+    details <i class="bi bi-arrow-right" aria-hidden="true"></i></a>
+{% if progress.status in ['ADMIN_REJECTED', 'SECURITY_CHECK_FAILED'] and
+app_record.status.value not in ['blocked', 'deleted'] %}
+<a class="review-button resubmit"
+    href="{{ url_for('main.submit_app_version', app_id=app_record.id) if app_record.pending_version else url_for('main.submit_app', app_id=app_record.id) }}">Fix
+    &amp; resubmit</a>
+{% elif app_record.status.value == 'approved' %}
+<a class="review-button"
+    href="{{ url_for('main.app_detail', slug=app_record.slug) }}">Store <i
+        class="bi bi-arrow-up-right" aria-hidden="true"></i></a>
+{% if not app_record.pending_version %}<a class="review-button release"
+    href="{{ url_for('main.submit_app_version', app_id=app_record.id) }}">New
+    version <i class="bi bi-plus" aria-hidden="true"></i></a>{% endif %}
+{% endif %}

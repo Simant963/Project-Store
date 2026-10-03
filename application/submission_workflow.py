@@ -1,4 +1,5 @@
 """Latest-build state machine; marketplace visibility remains separate."""
+from datetime import datetime, timedelta, timezone
 from .database import db
 from .models import ApplicationStatusHistory, Notification, NotificationType, SubmissionStatus as S, UserRole
 
@@ -11,9 +12,17 @@ ALLOWED = {
     S.ADMIN_VERIFIED: {S.PUBLISH_PENDING}, S.PUBLISH_PENDING: {S.PUBLISHED},
     S.ADMIN_REJECTED: set(), S.PUBLISHED: set(),
 }
-LABELS = dict(zip(S, ["App uploaded", "Security checks pending", "Security checks passed",
-    "Security checks failed", "Waiting for admin verification", "Verified by admin",
-    "Application rejected", "Verified — waiting to publish", "App published / live"]))
+LABELS = {
+    S.UPLOADED: "App uploaded",
+    S.SECURITY_CHECK_PENDING: "Security checks pending",
+    S.SECURITY_CHECK_PASSED: "Security checks passed",
+    S.SECURITY_CHECK_FAILED: "Security checks failed",
+    S.ADMIN_REVIEW_PENDING: "Waiting for admin verification",
+    S.ADMIN_VERIFIED: "Verified by admin",
+    S.ADMIN_REJECTED: "Application rejected",
+    S.PUBLISH_PENDING: "Verified — waiting to publish",
+    S.PUBLISHED: "App published / live",
+}
 
 
 def set_status(app, target, actor=None, reason=None, initial=False):
@@ -52,6 +61,8 @@ def start_submission(app, developer):
 def submission_view(app):
     status = app.submission_status or S.UPLOADED
     pending = bool(app.pending_version)
+    scan_running = bool(app.scan_started_at and datetime.now(timezone.utc) -
+                        app.scan_started_at.replace(tzinfo=timezone.utc) < timedelta(minutes=10))
     scanned = getattr(app, ("pending_" if pending else "") + "security_scanned_at")
     submitted = app.pending_release_submitted_at if pending else app.submitted_at
     stage = (1 if status in {S.UPLOADED, S.SECURITY_CHECK_PENDING, S.SECURITY_CHECK_FAILED}
@@ -73,4 +84,4 @@ def submission_view(app):
             "version": app.pending_version or app.version, "feedback": app.submission_feedback,
             "updated_at": app.updated_at, "security": steps[1]["label"],
             "admin": steps[2]["label"], "publishing": steps[3]["label"],
-            "changes_requested": app.changes_requested}
+            "changes_requested": app.changes_requested, "scan_running": scan_running}

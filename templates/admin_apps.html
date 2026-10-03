@@ -1,19 +1,163 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
-    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>App review | Appora Admin</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&amp;family=Plus+Jakarta+Sans:wght@600;700;800&amp;display=swap" rel="stylesheet"><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"><link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet"><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-<link rel="stylesheet" href="{{ url_for('static', filename='interior-3d.css') }}"><script nonce="{{ csp_nonce }}" defer src="{{ url_for('static', filename='interior-3d.js') }}"></script><link rel="stylesheet" href="{{ url_for('static', filename='submission-progress.css') }}"><script nonce="{{ csp_nonce }}" defer src="{{ url_for('static', filename='submission-progress.js') }}"></script></head>
-<body class="admin-page" data-submission-live="{{ url_for('main.submission_status_snapshot') }}" data-submission-events="{{ url_for('main.admin_app_events') }}">
-    <aside class="admin-sidebar" id="adminSidebar"><a class="navbar-brand" href="{{ url_for('main.admin_dashboard') }}"><span class="brand-mark"><i class="bi bi-boxes"></i></span>Appora</a><span class="sidebar-label">Workspace</span><nav class="sidebar-nav"><a href="{{ url_for('main.admin_dashboard') }}"><i class="bi bi-people"></i>Accounts</a><a href="{{ url_for('main.admin_dashboard', status='pending') }}"><i class="bi bi-person-check"></i>Developer approvals</a><a class="active" href="{{ url_for('main.admin_apps') }}"><i class="bi bi-box-seam"></i>Apps{% if counts.pending %}<span>{{ counts.pending }}</span>{% endif %}</a><a href="{{ url_for('main.app_marketplace') }}"><i class="bi bi-shop"></i>Storefront</a></nav><div class="sidebar-admin"><span class="admin-avatar">{{ admin.initials }}</span><div><strong>{{ admin.username }}</strong><small>Administrator</small></div><form method="post" action="{{ url_for('main.logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit"><i class="bi bi-box-arrow-right"></i></button></form></div></aside>
-    <main class="admin-main">
-        <header class="admin-topbar"><button class="sidebar-toggle" type="button" id="sidebarToggle"><i class="bi bi-list"></i></button><div><p>Marketplace control</p><h1>App submissions</h1></div><div class="topbar-actions"><span class="live-connection" id="liveConnection"><i></i><span>Connecting</span></span><a class="topbar-store-link" href="{{ url_for('main.app_marketplace') }}"><i class="bi bi-box-arrow-up-right"></i><span>Open store</span></a></div></header>
-        {% with messages = get_flashed_messages(with_categories=true) %}{% for category, message in messages %}<div class="dashboard-alert {{ category }}"><i class="bi {{ 'bi-check-circle-fill' if category == 'success' else 'bi-exclamation-circle-fill' }}"></i>{{ message }}</div>{% endfor %}{% endwith %}
-        <section class="admin-stats"><article><span class="stat-icon total"><i class="bi bi-boxes"></i></span><div><small>All submissions</small><strong>{{ counts.total }}</strong><p>Every app release</p></div></article><article><span class="stat-icon pending"><i class="bi bi-hourglass-split"></i></span><div><small>Pending review</small><strong>{{ counts.pending }}</strong><p>Needs your decision</p></div></article><article><span class="stat-icon developers"><i class="bi bi-patch-check"></i></span><div><small>Published</small><strong>{{ counts.approved }}</strong><p>Available to download</p></div></article><article><span class="stat-icon blocked"><i class="bi bi-slash-circle"></i></span><div><small>Blocked</small><strong>{{ counts.blocked }}</strong><p>Removed from store</p></div></article></section>
-        <section class="management-panel"><div class="management-heading"><div><h2>Review queue</h2><p>Inspect the APK and listing before publishing.</p></div></div><form class="account-filters" method="get"><div class="admin-search"><i class="bi bi-search"></i><input type="search" name="q" value="{{ query_text }}" placeholder="Search app, developer, or application ID"></div><select name="status"><option value="all">All statuses</option>{% for value, label in [('pending','Pending'),('security_failed','Security Failed'),('waiting_review','Waiting for Review'),('verified','Verified'),('rejected','Rejected'),('published','Published'),('blocked','Blocked')] %}<option value="{{ value }}" {{ 'selected' if status_value == value else '' }}>{{ label }}</option>{% endfor %}</select><button type="submit">Apply filters</button>{% if query_text or status_value != 'all' %}<a class="clear-filters" href="{{ url_for('main.admin_apps') }}">Clear</a>{% endif %}</form>
-            <div class="account-table-wrap"><table class="account-table app-admin-table"><thead><tr><th>App</th><th>Developer</th><th>Release</th><th>Security</th><th>Admin Review</th><th>Publishing</th><th>Current Status</th><th>Submitted</th><th></th></tr></thead><tbody>{% for app in apps %}<tr><td><div class="account-identity"><img class="table-app-icon" src="{{ url_for('main.app_icon', app_id=app.id) }}" alt=""><div><strong>{{ app.name }}</strong><small>{{ app.package_name }}</small></div></div></td><td><a class="developer-link" href="{{ url_for('main.admin_developer_review', user_id=app.developer.id) }}">{{ app.developer.company_name or app.developer.username }}</a></td><td><span class="joined-date">v{{ app.pending_version if app.has_pending_release else app.version }}<small>{{ app.pending_formatted_size if app.has_pending_release else app.formatted_size }}</small></span></td><td data-submission-security="{{ app.id }}">{{ submission_view(app).security }}</td><td data-submission-admin="{{ app.id }}">{{ submission_view(app).admin }}</td><td data-submission-publishing="{{ app.id }}">{{ submission_view(app).publishing }}</td><td data-submission-label="{{ app.id }}">{{ submission_view(app).label }}</td><td><span class="joined-date">{{ (app.pending_release_submitted_at if app.has_pending_release else app.submitted_at).strftime('%d %b %Y') }}</span></td><td><a class="review-button" href="{{ url_for('main.admin_app_review', app_id=app.id) }}">Review <i class="bi bi-arrow-right"></i></a></td></tr><tr class="submission-row"><td colspan="9">{% set app_record = app %}{% include '_submission_progress.html' %}</td></tr>{% else %}<tr><td colspan="9"><div class="empty-accounts"><span><i class="bi bi-box-seam"></i></span><h3>No app submissions found</h3><p>New developer uploads will appear here in real time.</p></div></td></tr>{% endfor %}</tbody></table></div>{% include '_pagination.html' %}
-        </section>
-    <p class="submission-connection" role="status" data-submission-connection>Connecting to live updates…</p></main><div class="sidebar-backdrop" id="sidebarBackdrop"></div><div class="live-toast" id="liveToast">App submissions updated</div>
-    <script nonce="{{ csp_nonce }}">const sidebar=document.getElementById('adminSidebar'),backdrop=document.getElementById('sidebarBackdrop'),live=document.getElementById('liveConnection');document.getElementById('sidebarToggle').addEventListener('click',()=>{sidebar.classList.toggle('open');backdrop.classList.toggle('show')});backdrop.addEventListener('click',()=>{sidebar.classList.remove('open');backdrop.classList.remove('show')});const stream=new EventSource('{{ url_for("main.admin_app_events") }}');stream.addEventListener('open',()=>{live.classList.add('online');live.querySelector('span').textContent='Live'});stream.addEventListener('error',()=>{live.classList.remove('online');live.querySelector('span').textContent='Reconnecting'});</script>
-</body>
+    <head>
+        <meta charset="UTF-8"><meta name="viewport"
+            content="width=device-width, initial-scale=1.0"><title>App review |
+            Appora Admin</title>
+        <link rel="preconnect" href="https://fonts.googleapis.com"><link
+            rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link
+            href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&amp;family=Plus+Jakarta+Sans:wght@600;700;800&amp;display=swap"
+            rel="stylesheet"><link
+            href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+            rel="stylesheet"><link
+            href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css"
+            rel="stylesheet"><link rel="stylesheet"
+            href="{{ url_for('static', filename='style.css') }}">
+        <link rel="stylesheet"
+            href="{{ url_for('static', filename='interior-3d.css') }}"><script
+            nonce="{{ csp_nonce }}" defer
+            src="{{ url_for('static', filename='interior-3d.js') }}"></script><link
+            rel="stylesheet"
+            href="{{ url_for('static', filename='submission-progress.css') }}"><script
+            nonce="{{ csp_nonce }}" defer
+            src="{{ url_for('static', filename='submission-progress.js') }}"></script></head>
+    <body class="admin-page"
+        data-submission-live="{{ url_for('main.submission_status_snapshot') }}"
+        data-submission-events="{{ url_for('main.admin_app_events') }}">
+        <aside class="admin-sidebar" id="adminSidebar"><a class="navbar-brand"
+                href="{{ url_for('main.admin_dashboard') }}"><span
+                    class="brand-mark"><i
+                        class="bi bi-boxes"></i></span>Appora</a><span
+                class="sidebar-label">Workspace</span><nav
+                class="sidebar-nav"><a
+                    href="{{ url_for('main.admin_dashboard') }}"><i
+                        class="bi bi-people"></i>Accounts</a><a
+                    href="{{ url_for('main.admin_dashboard', status='pending') }}"><i
+                        class="bi bi-person-check"></i>Developer approvals</a><a
+                    class="active" href="{{ url_for('main.admin_apps') }}"><i
+                        class="bi bi-box-seam"></i>Apps{% if counts.pending
+                    %}<span>{{ counts.pending }}</span>{% endif %}</a><a
+                    href="{{ url_for('main.app_marketplace') }}"><i
+                        class="bi bi-shop"></i>Storefront</a></nav><div
+                class="sidebar-admin"><span class="admin-avatar">{{
+                    admin.initials }}</span><div><strong>{{ admin.username
+                        }}</strong><small>Administrator</small></div><form
+                    method="post" action="{{ url_for('main.logout') }}"><input
+                        type="hidden" name="csrf_token"
+                        value="{{ csrf_token }}"><button type="submit"><i
+                            class="bi bi-box-arrow-right"></i></button></form></div></aside>
+        <main class="admin-main">
+            <header class="admin-topbar"><button class="sidebar-toggle"
+                    type="button" id="sidebarToggle"><i
+                        class="bi bi-list"></i></button><div><p>Marketplace
+                        control</p><h1>App submissions</h1></div><div
+                    class="topbar-actions"><span class="live-connection"
+                        id="liveConnection"><i></i><span>Connecting</span></span><a
+                        class="topbar-store-link"
+                        href="{{ url_for('main.app_marketplace') }}"><i
+                            class="bi bi-box-arrow-up-right"></i><span>Open
+                            store</span></a></div></header>
+            {% with messages = get_flashed_messages(with_categories=true) %}{%
+            for category, message in messages %}<div
+                class="dashboard-alert {{ category }}"><i
+                    class="bi {{ 'bi-check-circle-fill' if category == 'success' else 'bi-exclamation-circle-fill' }}"></i>{{
+                message }}</div>{% endfor %}{% endwith %}
+            <section class="admin-stats"><article><span
+                        class="stat-icon total"><i
+                            class="bi bi-boxes"></i></span><div><small>All
+                            submissions</small><strong>{{ counts.total
+                            }}</strong><p>Every app
+                            release</p></div></article><article><span
+                        class="stat-icon pending"><i
+                            class="bi bi-hourglass-split"></i></span><div><small>Pending
+                            review</small><strong>{{ counts.pending
+                            }}</strong><p>Needs your
+                            decision</p></div></article><article><span
+                        class="stat-icon developers"><i
+                            class="bi bi-patch-check"></i></span><div><small>Published</small><strong>{{
+                            counts.approved }}</strong><p>Available to
+                            download</p></div></article><article><span
+                        class="stat-icon blocked"><i
+                            class="bi bi-slash-circle"></i></span><div><small>Blocked</small><strong>{{
+                            counts.blocked }}</strong><p>Removed from
+                            store</p></div></article></section>
+            <section class="management-panel"><div
+                    class="management-heading"><div><h2>Review
+                            queue</h2><p>Inspect the APK and listing before
+                            publishing.</p></div></div><form
+                    class="account-filters" method="get"><div
+                        class="admin-search"><i class="bi bi-search"></i><input
+                            type="search" name="q" value="{{ query_text }}"
+                            placeholder="Search app, developer, or application ID"></div><select
+                        name="status"><option value="all">All
+                            statuses</option>{% for value, label in
+                        [('pending','Pending'),('security_failed','Security Failed'),('waiting_review','Waiting for Review'),('verified','Verified'),('rejected','Rejected'),('published','Published'),('blocked','Blocked')]
+                        %}<option value="{{ value }}" {{ 'selected' if
+                            status_value == value else '' }}>{{ label
+                            }}</option>{% endfor %}</select><button
+                        type="submit">Apply filters</button>{% if query_text or
+                    status_value != 'all' %}<a class="clear-filters"
+                        href="{{ url_for('main.admin_apps') }}">Clear</a>{%
+                    endif %}</form>
+                <div class="account-table-wrap"><table
+                        class="account-table app-admin-table"><thead><tr><th>App</th><th>Developer</th><th>Release</th><th>Security</th><th>Admin
+                                    Review</th><th>Publishing</th><th>Current
+                                    Status</th><th>Submitted</th><th></th></tr></thead><tbody>{%
+                            for app in apps %}<tr><td><div
+                                        class="account-identity"><img
+                                            class="table-app-icon"
+                                            src="{{ url_for('main.app_icon', app_id=app.id) }}"
+                                            alt><div><strong>{{ app.name
+                                                }}</strong><small>{{
+                                                app.package_name
+                                                }}</small></div></div></td><td><a
+                                        class="developer-link"
+                                        href="{{ url_for('main.admin_developer_review', user_id=app.developer.id) }}">{{
+                                        app.developer.company_name or
+                                        app.developer.username
+                                        }}</a></td><td><span
+                                        class="joined-date">v{{
+                                        app.pending_version if
+                                        app.has_pending_release else app.version
+                                        }}<small>{{ app.pending_formatted_size
+                                            if app.has_pending_release else
+                                            app.formatted_size
+                                            }}</small></span></td><td
+                                    data-submission-security="{{ app.id }}">{{
+                                    submission_view(app).security }}</td><td
+                                    data-submission-admin="{{ app.id }}">{{
+                                    submission_view(app).admin }}</td><td
+                                    data-submission-publishing="{{ app.id }}">{{
+                                    submission_view(app).publishing }}</td><td
+                                    data-submission-label="{{ app.id }}">{{
+                                    submission_view(app).label }}</td><td><span
+                                        class="joined-date">{{
+                                        (app.pending_release_submitted_at if
+                                        app.has_pending_release else
+                                        app.submitted_at).strftime('%d %b %Y')
+                                        }}</span></td><td><a
+                                        class="review-button"
+                                        href="{{ url_for('main.admin_app_review', app_id=app.id) }}">Review
+                                        <i
+                                            class="bi bi-arrow-right"></i></a></td></tr><tr
+                                class="submission-row"><td colspan="9">{% set
+                                    app_record = app %}{% include
+                                    '_submission_progress.html' %}</td></tr>{%
+                            else %}<tr><td colspan="9"><div
+                                        class="empty-accounts"><span><i
+                                                class="bi bi-box-seam"></i></span><h3>No
+                                            app submissions found</h3><p>New
+                                            developer uploads will appear here
+                                            in real time.</p></div></td></tr>{%
+                            endfor %}</tbody></table></div>{% include
+                '_pagination.html' %}
+            </section>
+            <p class="submission-connection" role="status"
+                data-submission-connection>Connecting to live
+                updates…</p></main><div class="sidebar-backdrop"
+            id="sidebarBackdrop"></div><div class="live-toast"
+            id="liveToast">App submissions updated</div>
+        <script
+            nonce="{{ csp_nonce }}">const sidebar=document.getElementById('adminSidebar'),backdrop=document.getElementById('sidebarBackdrop'),live=document.getElementById('liveConnection');document.getElementById('sidebarToggle').addEventListener('click',()=>{sidebar.classList.toggle('open');backdrop.classList.toggle('show')});backdrop.addEventListener('click',()=>{sidebar.classList.remove('open');backdrop.classList.remove('show')});const stream=new EventSource('{{ url_for("main.admin_app_events") }}');stream.addEventListener('open',()=>{live.classList.add('online');live.querySelector('span').textContent='Live'});stream.addEventListener('error',()=>{live.classList.remove('online');live.querySelector('span').textContent='Reconnecting'});</script>
+    </body>
 </html>

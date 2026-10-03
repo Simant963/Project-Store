@@ -1,27 +1,116 @@
 {% set progress = submission_view(app_record) %}
-<section class="submission-panel" data-submission-panel="{{ app_record.id }}" data-revision="{{ progress.revision }}">
-    <div class="submission-panel-title"><div><span class="section-label">Release journey</span><h2>Submission progress</h2></div><span class="submission-status">#{{ app_record.id }}</span></div>
+<section class="submission-panel" data-submission-panel="{{ app_record.id }}"
+    data-revision="{{ progress.revision }}"
+    data-scan-running="{{ '1' if progress.scan_running else '0' }}">
+    <div class="submission-panel-title"><div><span class="section-label">Release
+                journey</span><h2>Submission progress</h2></div><span
+            class="submission-status">#{{ app_record.id }}</span></div>
     {% include '_submission_progress.html' %}
-    {% if app_record.status.value in ['blocked', 'deleted'] %}<div class="submission-feedback error"><strong>This app is {{ app_record.status.value }} and is not downloadable.</strong><p>{{ app_record.review_note or 'Contact the administrator for more information.' }}</p></div>{% endif %}
-    {% if app_record.pending_version and app_record.status.value == 'approved' %}<p>Version {{ app_record.version }} remains live while v{{ app_record.pending_version }} is reviewed.</p>{% endif %}
-    {% if app_record.scan_started_at %}<p role="status"><i class="bi bi-hourglass-split" aria-hidden="true"></i> Security scan is running. Results will appear automatically.</p>{% endif %}
-    {% if progress.feedback %}<div class="submission-feedback {{ 'error' if progress.status in ['ADMIN_REJECTED', 'SECURITY_CHECK_FAILED'] else '' }}"><strong>{{ 'Changes requested' if progress.changes_requested else 'Application rejected' if progress.status == 'ADMIN_REJECTED' else 'Security check failed' if progress.status == 'SECURITY_CHECK_FAILED' else 'Admin feedback' }}</strong><p>{{ progress.feedback }}</p></div>{% endif %}
-    {% if progress.status == 'PUBLISHED' and app_record.status.value == 'approved' %}<p class="submission-success"><i class="bi bi-check-circle" aria-hidden="true"></i> Your application is now live.</p>{% endif %}
-    {% if not admin and progress.status in ['ADMIN_REJECTED', 'SECURITY_CHECK_FAILED'] and app_record.status.value not in ['blocked', 'deleted'] %}<p>Update the application information or replace the APK, then resubmit for a fresh security check.</p><a class="btn btn-primary rounded-pill" href="{{ url_for('main.submit_app_version', app_id=app_record.id) if app_record.pending_version else url_for('main.submit_app', app_id=app_record.id) }}">Fix &amp; resubmit</a>{% endif %}
+    {% if app_record.status.value in ['blocked', 'deleted'] %}<div
+        class="submission-feedback error"><strong>This app is {{
+            app_record.status.value }} and is not downloadable.</strong><p>{{
+            app_record.review_note or
+            'Contact the administrator for more information.' }}</p></div>{%
+    endif %}
+    {% if app_record.pending_version and app_record.status.value == 'approved'
+    %}<p>Version {{ app_record.version }} remains live while v{{
+        app_record.pending_version }} is reviewed.</p>{% endif %}
+    {% if progress.scan_running %}<p role="status"><i
+            class="bi bi-hourglass-split" aria-hidden="true"></i> Security scan
+        is running. Results will appear automatically.</p>{% endif %}
+    {% if progress.feedback %}<div
+        class="submission-feedback {{ 'error' if progress.status in ['ADMIN_REJECTED', 'SECURITY_CHECK_FAILED'] else '' }}"><strong>{{
+            'Changes requested' if progress.changes_requested else
+            'Application rejected' if progress.status == 'ADMIN_REJECTED' else
+            'Security check failed' if progress.status ==
+            'SECURITY_CHECK_FAILED' else 'Admin feedback' }}</strong><p>{{
+            progress.feedback }}</p></div>{% endif %}
+    {% if progress.status == 'PUBLISHED' and app_record.status.value ==
+    'approved' %}<p class="submission-success"><i class="bi bi-check-circle"
+            aria-hidden="true"></i> Your application is now live.</p><a
+        class="review-button"
+        href="{{ url_for('main.app_detail', slug=app_record.slug) }}">View live
+        listing</a>{% endif %}
+    {% if not admin and progress.status in ['ADMIN_REJECTED',
+    'SECURITY_CHECK_FAILED'] and app_record.status.value not in ['blocked',
+    'deleted'] %}<p>Update the application information or replace the APK, then
+        resubmit for a fresh security check.</p><a
+        class="btn btn-primary rounded-pill"
+        href="{{ url_for('main.submit_app_version', app_id=app_record.id) if app_record.pending_version else url_for('main.submit_app', app_id=app_record.id) }}">Fix
+        &amp; resubmit</a>{% endif %}
     {% if admin and app_record.status.value not in ['deleted', 'blocked'] %}
     <div class="submission-actions">
-        {% if progress.status in ['SECURITY_CHECK_PENDING', 'SECURITY_CHECK_FAILED'] %}
-        <form method="post" action="{{ url_for('main.scan_app', app_id=app_record.id) }}" data-submission-action data-confirm="Run security checks for {{ app_record.name }}? The APK will be checked using static analysis and ClamAV.">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="target" value="{{ 'pending' if app_record.pending_version else 'current' }}"><button class="btn btn-primary rounded-pill" type="submit" {{ 'disabled' if app_record.scan_started_at else '' }}>Run security check</button>
+        {% if progress.status in ['SECURITY_CHECK_PENDING',
+        'SECURITY_CHECK_FAILED'] %}
+        <form method="post"
+            action="{{ url_for('main.scan_app', app_id=app_record.id) }}"
+            data-submission-action
+            data-confirm="Run security checks for {{ app_record.name }}? The APK will be checked using static analysis and ClamAV.">
+            <input type="hidden" name="csrf_token"
+                value="{{ csrf_token }}"><input type="hidden" name="target"
+                value="{{ 'pending' if app_record.pending_version else 'current' }}"><button
+                class="btn btn-primary rounded-pill" type="submit" {{ 'disabled'
+                if progress.scan_running else '' }}>Run security check</button>
         </form>
         {% elif progress.status == 'ADMIN_REVIEW_PENDING' %}
-        <form method="post" action="{{ url_for('main.manage_app', app_id=app_record.id, action='approve') }}" data-submission-action data-confirm="Verify {{ app_record.name }}? This does not publish the app; publication requires a separate confirmation."><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="revision" value="{{ progress.revision }}"><label for="approval-note">Optional admin note</label><textarea id="approval-note" name="review_note" maxlength="4000" rows="2"></textarea><button class="btn btn-success rounded-pill" type="submit">Approve App</button></form>
-        <form method="post" action="{{ url_for('main.manage_app', app_id=app_record.id, action='reject') }}" data-submission-action data-confirm="Reject {{ app_record.name }} and send this reason to the developer?"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="revision" value="{{ progress.revision }}"><label for="rejection-note">Rejection reason (required)</label><textarea id="rejection-note" name="review_note" required maxlength="4000" rows="2"></textarea><button class="btn btn-outline-danger rounded-pill" type="submit">Reject App</button></form>
-        <form method="post" action="{{ url_for('main.manage_app', app_id=app_record.id, action='request-changes') }}" data-submission-action data-confirm="Request changes from the developer? They must resubmit and pass security checks again."><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="revision" value="{{ progress.revision }}"><label for="changes-note">Required changes</label><textarea id="changes-note" name="review_note" required maxlength="4000" rows="2"></textarea><button class="btn btn-outline-primary rounded-pill" type="submit">Request Changes</button></form>
+        <form method="post"
+            action="{{ url_for('main.manage_app', app_id=app_record.id, action='approve') }}"
+            data-submission-action
+            data-confirm="Verify {{ app_record.name }}? This does not publish the app; publication requires a separate confirmation."><input
+                type="hidden" name="csrf_token" value="{{ csrf_token }}"><input
+                type="hidden" name="revision"
+                value="{{ progress.revision }}"><label
+                for="approval-note">Optional admin note</label><textarea
+                id="approval-note" name="review_note" maxlength="4000"
+                rows="2"></textarea><button class="btn btn-success rounded-pill"
+                type="submit">Approve App</button></form>
+        <form method="post"
+            action="{{ url_for('main.manage_app', app_id=app_record.id, action='reject') }}"
+            data-submission-action
+            data-confirm="Reject {{ app_record.name }} and send this reason to the developer?"><input
+                type="hidden" name="csrf_token" value="{{ csrf_token }}"><input
+                type="hidden" name="revision"
+                value="{{ progress.revision }}"><label
+                for="rejection-note">Rejection reason
+                (required)</label><textarea id="rejection-note"
+                name="review_note" required maxlength="4000"
+                rows="2"></textarea><button
+                class="btn btn-outline-danger rounded-pill" type="submit">Reject
+                App</button></form>
+        <form method="post"
+            action="{{ url_for('main.manage_app', app_id=app_record.id, action='request-changes') }}"
+            data-submission-action
+            data-confirm="Request changes from the developer? They must resubmit and pass security checks again."><input
+                type="hidden" name="csrf_token" value="{{ csrf_token }}"><input
+                type="hidden" name="revision"
+                value="{{ progress.revision }}"><label
+                for="changes-note">Required changes</label><textarea
+                id="changes-note" name="review_note" required maxlength="4000"
+                rows="2"></textarea><button
+                class="btn btn-outline-primary rounded-pill"
+                type="submit">Request Changes</button></form>
         {% elif progress.status == 'PUBLISH_PENDING' %}
-        <form method="post" action="{{ url_for('main.manage_app', app_id=app_record.id, action='publish') }}" data-submission-action data-confirm="Publish {{ app_record.name }} v{{ progress.version }}? It will become publicly available for download."><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="revision" value="{{ progress.revision }}"><button class="btn btn-primary rounded-pill" type="submit">Publish App</button></form>
+        <form method="post"
+            action="{{ url_for('main.manage_app', app_id=app_record.id, action='publish') }}"
+            data-submission-action
+            data-confirm="Publish {{ app_record.name }} v{{ progress.version }}? It will become publicly available for download."><input
+                type="hidden" name="csrf_token" value="{{ csrf_token }}"><input
+                type="hidden" name="revision"
+                value="{{ progress.revision }}"><button
+                class="btn btn-primary rounded-pill" type="submit">Publish
+                App</button></form>
         {% endif %}
     </div>
     {% endif %}
-    <details class="submission-history"><summary>Status history &amp; audit trail</summary><ol>{% for entry in app_record.submission_history %}<li><strong>{{ entry.new_status.replace('_', ' ').title() }}</strong> · v{{ entry.version }}<p>{{ entry.reason or '' }}</p><small>By {{ entry.changed_by.username if entry.changed_by else 'System' }} ({{ entry.changed_by_role }}) · <time data-local-time datetime="{{ entry.created_at.isoformat() }}Z">{{ entry.created_at.strftime('%d %b %Y, %H:%M') }} UTC</time></small></li>{% else %}<li>No status history yet.</li>{% endfor %}</ol></details>
+    <details class="submission-history"><summary>Status history &amp; audit
+            trail</summary><ol>{% for entry in app_record.submission_history
+            %}<li><strong>{{ entry.new_status.replace('_', ' ').title()
+                    }}</strong> · v{{ entry.version }}<p>{{ entry.reason or ''
+                    }}</p><small>By {{ entry.changed_by.username if
+                    entry.changed_by else 'System' }} ({{ entry.changed_by_role
+                    }}) · <time data-local-time
+                        datetime="{{ entry.created_at.strftime('%Y-%m-%dT%H:%M:%S') }}Z">{{
+                        entry.created_at.strftime('%d %b %Y, %H:%M') }}
+                        UTC</time></small></li>{% else %}<li>No status history
+                yet.</li>{% endfor %}</ol></details>
 </section>

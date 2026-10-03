@@ -1,5 +1,31 @@
 {% if admin.role.value == 'admin' %}
-<section class="submission-panel"><h2>Store moderation</h2><p>These controls affect the public listing, not the submission review stage.</p><div class="submission-actions">
-{% if app_record.status.value == 'approved' %}<form method="post" action="{{ url_for('main.manage_app', app_id=app_record.id, action='block') }}" data-submission-action data-confirm="Block this app from the store? It will no longer be downloadable."><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="review_note" value="Removed by administrator"><button class="btn btn-outline-danger" type="submit">Block from store</button></form>{% endif %}
-{% if app_record.status.value != 'deleted' %}<form method="post" action="{{ url_for('main.manage_app', app_id=app_record.id, action='delete') }}" data-submission-action data-confirm="Move this app to trash? Its files and history will be preserved."><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-outline-danger" type="submit">Move to trash</button></form>{% else %}<form method="post" action="{{ url_for('main.manage_app', app_id=app_record.id, action='restore') }}" data-submission-action data-confirm="Restore this app to its previous marketplace status?"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-outline-success" type="submit">Restore app</button></form><form method="post" action="{{ url_for('main.manage_app', app_id=app_record.id, action='hard_delete') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-danger" type="submit">Permanent deletion verification</button></form>{% endif %}
-</div></section>{% endif %}
+<section class="submission-panel"><h2>Store moderation</h2><p>These controls
+        affect the public listing, not the submission review stage.</p><div
+        class="submission-actions">
+        {% if app_record.status.value == 'approved' %}<form method="post"
+            action="{{ url_for('main.manage_app', app_id=app_record.id, action='block') }}"
+            data-submission-action data-reload-after
+            data-confirm="Block this app from the store? It will no longer be downloadable."><input
+                type="hidden" name="csrf_token" value="{{ csrf_token }}"><input
+                type="hidden" name="review_note"
+                value="Removed by administrator"><button
+                class="btn btn-outline-danger" type="submit">Block from
+                store</button></form>{% endif %}
+        {% if app_record.status.value != 'deleted' %}<form method="post"
+            action="{{ url_for('main.manage_app', app_id=app_record.id, action='delete') }}"
+            data-submission-action data-reload-after
+            data-confirm="Move this app to trash? Its files and history will be preserved."><input
+                type="hidden" name="csrf_token" value="{{ csrf_token }}"><button
+                class="btn btn-outline-danger" type="submit">Move to
+                trash</button></form>{% else %}<form method="post"
+            action="{{ url_for('main.manage_app', app_id=app_record.id, action='restore') }}"
+            data-submission-action data-reload-after
+            data-confirm="Restore this app to its previous marketplace status?"><input
+                type="hidden" name="csrf_token" value="{{ csrf_token }}"><button
+                class="btn btn-outline-success" type="submit">Restore
+                app</button></form><form method="post"
+            action="{{ url_for('main.manage_app', app_id=app_record.id, action='hard_delete') }}"><input
+                type="hidden" name="csrf_token" value="{{ csrf_token }}"><button
+                class="btn btn-danger" type="submit">Permanent deletion
+                verification</button></form>{% endif %}
+    </div></section>{% endif %}

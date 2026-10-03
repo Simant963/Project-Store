@@ -240,15 +240,18 @@ class User(db.Model):
     )
 
     def set_password(self, password):
-        self.password_hash = generate_password_hash(password)
+        self.password_hash = generate_password_hash(password, method="scrypt:32768:8:3")
         self.session_version = (self.session_version or 0) + 1
 
     def check_password(self, password):
-        return check_password_hash(self.password_hash, password)
+        valid = check_password_hash(self.password_hash, password)
+        if valid and not self.password_hash.startswith("scrypt:32768:8:3$"):
+            self.password_hash = generate_password_hash(password, method="scrypt:32768:8:3")
+        return valid
 
     def set_security_answer(self, answer):
         normalized = " ".join(answer.casefold().split())
-        self.security_answer_hash = generate_password_hash(normalized)
+        self.security_answer_hash = generate_password_hash(normalized, method="scrypt:32768:8:3")
 
     def check_security_answer(self, answer):
         normalized = " ".join(answer.casefold().split())
@@ -274,10 +277,12 @@ class User(db.Model):
 
     def reject(self):
         self.status = AccountStatus.REJECTED
+        self.session_version = (self.session_version or 0) + 1
         self.approved_at = None
 
     def block(self):
         self.status = AccountStatus.BLOCKED
+        self.session_version = (self.session_version or 0) + 1
 
     def unblock(self):
         self.status = AccountStatus.APPROVED
@@ -288,6 +293,7 @@ class User(db.Model):
         if self.status != AccountStatus.DELETED:
             self.status_before_delete = self.status.value
         self.status = AccountStatus.DELETED
+        self.session_version = (self.session_version or 0) + 1
         self.deleted_at = datetime.now(timezone.utc)
 
     def restore(self):
@@ -753,6 +759,7 @@ class ManualPasswordReset(db.Model):
     __tablename__ = "manual_password_reset"
     __table_args__ = (
         db.Index("ix_manual_reset_status_created", "status", "created_at"),
+        db.UniqueConstraint("reference", name="manual_password_reset_reference_key"),
     )
 
     id = db.Column(db.Integer, primary_key=True)

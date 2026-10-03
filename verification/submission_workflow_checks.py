@@ -10,21 +10,31 @@ import os
 import sys
 import tempfile
 import zipfile
-from datetime import datetime, timezone
+import hashlib
+import re
+from contextlib import nullcontext
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 scratch = tempfile.TemporaryDirectory(prefix="appora-submission-")
-os.environ.update(APP_ENV="development", DATABASE_URL="sqlite:///" + str(Path(scratch.name) / "workflow.db"),
+fixture_database_url = "sqlite:///" + str(Path(scratch.name) / "workflow.db")
+if "--postgres" in sys.argv:
+    from sqlalchemy.engine import make_url
+    fixture_database_url = os.environ["APPORA_VERIFY_DATABASE_URL"]
+    fixture_url = make_url(fixture_database_url)
+    if fixture_url.database != "appora_submission" or fixture_url.host != "appora-submission-db":
+        raise RuntimeError("PostgreSQL verification must use the isolated appora-submission-db fixture.")
+os.environ.update(APP_ENV="development", DATABASE_URL=fixture_database_url,
     PRIVATE_UPLOAD_ROOT=str(Path(scratch.name) / "uploads"), AUTO_MIGRATE="false", REDIS_URL="",
     SECRET_KEY="isolated-submission-check-not-a-production-secret", SESSION_COOKIE_SECURE="false",
-    ADMIN_PASSWORD="", TRUST_PROXY="false", FLASK_DEBUG="false")
+    ADMIN_PASSWORD="", TRUST_PROXY="false", FLASK_DEBUG="false", CLAMAV_COMMAND="clamscan")
 from app import app
 from application.database import db
 from application.models import (User, UserRole, AccountStatus, DeveloperProfile, GovernmentIdType,
-    StoreApp, SubmissionStatus as S, ApplicationStatusHistory, Notification, MarketplaceSettings)
-from flask_migrate import upgrade
+    StoreApp, SubmissionStatus as S, ApplicationStatusHistory, Notification, MarketplaceSettings, AppCategory)
+from flask_migrate import upgrade, check
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.exc import StaleDataError
 
@@ -38,6 +48,7 @@ atexit.register(close_fixture_database)
 
 with app.app_context():
     upgrade()
+    check()
     for username, role in [("preview_dev", UserRole.DEVELOPER), ("other_dev", UserRole.DEVELOPER),
                            ("preview_admin", UserRole.ADMIN), ("preview_reviewer", UserRole.CO_ADMIN), ("preview_user", UserRole.USER)]:
         user = User(username=username, email=username + "@example.test", role=role, status=AccountStatus.APPROVED)
@@ -94,7 +105,8 @@ def upload(client, number):
     from PIL import Image
     image = io.BytesIO(); Image.new("RGB", (64,64), "purple").save(image, format="PNG"); image.seek(0)
     data = fields(number)
-    data.update(csrf_token=token(client), app_icon=(image, "icon.png"), apk_file=(io.BytesIO(apk_bytes(str(number))), "fixture.apk"))
+    data.update(csrf_token=token(client), app_icon=(image, "icon.png"), apk_file=(io.BytesIO(apk_bytes(str(number))), "fixture.apk"),
+                submission_status="PUBLISHED", status="approved", security_scan_status="passed", verified_by_id="1")
     result = client.post("/developer/apps/new", data=data, content_type="multipart/form-data")
     expect(result.status_code == 302, "Upload did not redirect: " + result.get_data(as_text=True)[:120])
     with app.app_context():
@@ -119,7 +131,8 @@ def scan(client, app_id):
     return client.post(f"/admin/apps/{app_id}/scan", data={"csrf_token":token(client)})
 
 
-with patch("application.controllers.scan_apk_for_malware", return_value="Isolated ClamAV fixture: clean"):
+antivirus_fixture = nullcontext() if "--real-antivirus" in sys.argv else patch("application.controllers.scan_apk_for_malware", return_value="Isolated ClamAV fixture: clean")
+with antivirus_fixture:
     developer = login("preview_dev", "/login/developer")
     other = login("other_dev", "/login/developer")
     admin = login("preview_admin", "/admin/login")
@@ -157,7 +170,7 @@ with patch("application.controllers.scan_apk_for_malware", return_value="Isolate
     expect(action(admin,first,"publish").json.get("unchanged"), "Duplicate publication must be idempotent")
     with app.app_context(): expect(ApplicationStatusHistory.query.count() == history_count, "Duplicate publication history")
     expect(scan(admin,first).status_code == 409, "Published build cannot return to security checks")
-    expect(developer.get(f"/apps/{slug}/download").status_code in [200,302,404], "Download raised an error")
+    expect(developer.get(f"/apps/{slug}/download").status_code == 200, "Published download failed")
 
     rejected = upload(developer, 2)
     scan(admin,rejected)
@@ -184,6 +197,52 @@ with patch("application.controllers.scan_apk_for_malware", return_value="Isolate
         (Path(app.config["PRIVATE_UPLOAD_ROOT"]) / "apks" / record.apk_file).unlink()
     scan(admin,missing)
     expect(status(missing) == S.SECURITY_CHECK_FAILED, "Missing file must persist a failed stage")
+
+    malformed = upload(developer, 5)
+    with app.app_context():
+        record = db.session.get(StoreApp, malformed)
+        path = Path(app.config["PRIVATE_UPLOAD_ROOT"]) / "apks" / record.apk_file
+        path.write_bytes(b"not an APK archive")
+        record.apk_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+        db.session.commit()
+    scan(admin, malformed)
+    expect(status(malformed) == S.SECURITY_CHECK_FAILED, "Corrupted file must fail security checks")
+
+    if "--real-antivirus" in sys.argv:
+        virus_fixture = upload(developer, 6)
+        with app.app_context():
+            record = db.session.get(StoreApp, virus_fixture)
+            path = Path(app.config["PRIVATE_UPLOAD_ROOT"]) / "apks" / record.apk_file
+            # Harmless antivirus test signature, assembled only inside the disposable container.
+            signature = b"X5O!P%@AP[4" + bytes([92]) + b"PZX54(P^)7CC)7}$" + b"EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+            with zipfile.ZipFile(path,"a") as archive: archive.writestr("assets/antivirus-fixture.txt", signature)
+            record.apk_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            db.session.commit()
+        scan(admin,virus_fixture)
+        expect(status(virus_fixture) == S.SECURITY_CHECK_FAILED, "Real ClamAV did not block the harmless antivirus fixture")
+        expect(b"detected" in developer.get(f"/developer/apps/{virus_fixture}").data, "Real virus finding missing from developer feedback")
+
+    protected = upload(developer, 7)
+    with app.app_context():
+        record = db.session.get(StoreApp, protected)
+        record.scan_started_at = datetime.now(timezone.utc)
+        db.session.commit()
+    expect(scan(admin,protected).status_code == 409, "Duplicate running scan must be rejected")
+    expect(b'disabled' in admin.get(f"/admin/apps/{protected}").data, "Running scan button should be disabled")
+    with app.app_context():
+        record = db.session.get(StoreApp,protected)
+        record.scan_started_at = datetime.now(timezone.utc) - timedelta(minutes=11)
+        db.session.commit()
+    snapshot = admin.get(f"/submission-status?ids={protected}&details=1").get_json()["items"][0]
+    expect(snapshot["scan_running"] is False, "Expired scan lease should allow retry")
+    expect('data-scan-running="0"' in snapshot["panel"], "Expired scan UI cannot recover")
+    scan(admin,protected)
+    expect(action(admin,protected,"request-changes",'<img src=x onerror="alert(1)">Fix the policy.').status_code == 200, "Changes request failed")
+    feedback = developer.get(f"/developer/apps/{protected}").data
+    expect(b'&lt;img src=x' in feedback and b'<img src=x' not in feedback, "Admin feedback HTML was not escaped")
+
+    admin.get(f"/admin/apps/{first}")
+    expect(admin.post(f"/admin/apps/{protected}/approve",data={},headers={"X-Requested-With":"fetch"}).status_code == 400, "CSRF protection bypassed")
 
     # A new version stays private; the previous published binary stays downloadable.
     update = {"csrf_token":token(developer), "version":"2.0", "min_android_version":"8.0", "changelog":"Updated fixture release",
@@ -218,8 +277,34 @@ with patch("application.controllers.scan_apk_for_malware", return_value="Isolate
     expect(admin.get("/admin/apps?q=preview_dev").status_code == 200, "Developer search failed")
     expect(developer.get(f"/submission-status?ids={first}&details=1").status_code == 200, "Live snapshot failed")
     expect(action(admin,first,"publish").status_code == 200, "Persisted published state failed on refresh")
-    print(f"PASS: {checks} isolated workflow checks; migrated SQLite schema, real static checks, mocked ClamAV.")
+    # The storefront must expose only public releases, with real detail/download links.
+    guest = app.test_client()
+    for client in [guest, developer, admin, normal]:
+        response = client.get("/")
+        expect(response.status_code == 200, "Storefront failed for an account role")
+    home_html = guest.get("/").get_data(as_text=True)
+    expect(home_html.count('<article class="store-app">') == 1, "Private or rejected submissions leaked onto the storefront")
+    category_html = home_html.split('<div class="category-strip"',1)[1].split('</div>',1)[0]
+    expect(category_html.count('<a ') == 12, "Category options missing")
+    def home_link(class_name):
+        return re.search(r'class="' + class_name + r'" href="([^"]+)"',home_html).group(1)
+    expect(home_link('header-cta') == '/register/developer', "Developer signup option missing")
+    expect(guest.get(home_link('details-button')).status_code == 200, "Storefront details link broken")
+    download = guest.get(home_link('download-button'))
+    expect(download.status_code == 200 and 'attachment;' in download.headers.get('Content-Disposition',''), "Storefront APK download broken")
+    download.get_data()
+    download.close()
+    expect(guest.get('/apps?category=tools&q=Preview').status_code == 200, "Category/search route broken")
+    with app.test_request_context('/'):
+        from flask import render_template, g
+        g.csp_nonce = "isolated-preview"
+        empty_html = render_template('universe.html',approved_apps=[],categories=AppCategory,viewer=None)
+    expect('No apps have been published yet' in empty_html, "Storefront empty state missing")
+    print(f"PASS: {checks} isolated workflow checks; migrated {'PostgreSQL' if '--postgres' in sys.argv else 'SQLite'} schema, real static checks, {'real ClamAV' if '--real-antivirus' in sys.argv else 'mocked ClamAV'}.")
     if "--serve" in sys.argv:
         print("Disposable UI preview at http://127.0.0.1:5013 — preview_dev / preview_admin, password Preview-only-123!")
         app.run(host="127.0.0.1",port=5013,debug=False,use_reloader=False,threaded=True)
+if "--security" in sys.argv:
+    from security_regression_checks import run
+    run(app, login, token, fields, apk_bytes)
 close_fixture_database()

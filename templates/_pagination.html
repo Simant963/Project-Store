@@ -1,1 +1,15 @@
-{% if pagination.pages > 1 %}<nav class="app-pagination" aria-label="Page navigation"><a class="{{ 'disabled' if not pagination.has_prev else '' }}" href="{{ url_for(request.endpoint, page=pagination.prev_num, **pagination_params) if pagination.has_prev else '#' }}" aria-label="Previous page"><i class="bi bi-chevron-left"></i></a>{% for page_number in pagination.iter_pages(left_edge=1,left_current=2,right_current=2,right_edge=1) %}{% if page_number %}<a class="{{ 'active' if page_number==pagination.page else '' }}" href="{{ url_for(request.endpoint, page=page_number, **pagination_params) }}">{{ page_number }}</a>{% else %}<span>…</span>{% endif %}{% endfor %}<a class="{{ 'disabled' if not pagination.has_next else '' }}" href="{{ url_for(request.endpoint, page=pagination.next_num, **pagination_params) if pagination.has_next else '#' }}" aria-label="Next page"><i class="bi bi-chevron-right"></i></a></nav>{% endif %}
+{% if pagination.pages > 1 %}<nav class="app-pagination"
+    aria-label="Page navigation"><a
+        class="{{ 'disabled' if not pagination.has_prev else '' }}"
+        href="{{ url_for(request.endpoint, page=pagination.prev_num, **pagination_params) if pagination.has_prev else '#' }}"
+        aria-label="Previous page"><i class="bi bi-chevron-left"></i></a>{% for
+    page_number in
+    pagination.iter_pages(left_edge=1,left_current=2,right_current=2,right_edge=1)
+    %}{% if page_number %}<a
+        class="{{ 'active' if page_number==pagination.page else '' }}"
+        href="{{ url_for(request.endpoint, page=page_number, **pagination_params) }}">{{
+        page_number }}</a>{% else %}<span>…</span>{% endif %}{% endfor %}<a
+        class="{{ 'disabled' if not pagination.has_next else '' }}"
+        href="{{ url_for(request.endpoint, page=pagination.next_num, **pagination_params) if pagination.has_next else '#' }}"
+        aria-label="Next page"><i class="bi bi-chevron-right"></i></a></nav>{%
+endif %}

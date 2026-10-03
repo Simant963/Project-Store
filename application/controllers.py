@@ -1,11 +1,14 @@
 import json
+import os
 import hashlib
 import re
 import secrets
 import smtplib
+import ssl
 # ClamAV runs as a fixed argument list; shell execution is never enabled.
 import subprocess  # nosec B404
 import zipfile
+import time
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from functools import wraps
@@ -74,7 +77,7 @@ from .submission_workflow import set_status, start_submission, submission_view
 from .username_linked_list import username_index
 
 main = Blueprint("main", __name__)
-_DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(32))
+_DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(32), method="scrypt:32768:8:3")
 CLAMAV_SCAN_OPTIONS = (
     "--no-summary",
     "--infected",
@@ -85,6 +88,13 @@ CLAMAV_SCAN_OPTIONS = (
     "--phishing-sigs=yes",
     "--phishing-scan-urls=yes",
     "--bytecode=yes",
+    "--alert-exceeds-max=yes",
+    "--alert-encrypted=yes",
+    "--max-filesize=512M",
+    "--max-scansize=1536M",
+    "--max-files=20000",
+    "--max-recursion=16",
+    "--max-scantime=0",  # Wall-clock subprocess timeout fails closed instead.
 )
 
 
@@ -99,13 +109,15 @@ def get_csrf_token():
 def valid_csrf_token():
     submitted = request.form.get("csrf_token", "")
     saved = session.get("_csrf_token", "")
-    return bool(saved) and secrets.compare_digest(saved, submitted)
+    return bool(saved) and submitted.isascii() and secrets.compare_digest(saved, submitted)
 
 
 def current_user():
     user_id = session.get("user_id")
     user = db.session.get(User, user_id) if user_id else None
-    if user is not None and session.get("session_version") == user.session_version:
+    privileged_expired = bool(user and user.role in {UserRole.ADMIN, UserRole.CO_ADMIN} and
+                              session.get("privileged_until", 0) <= time.time())
+    if user is not None and not privileged_expired and user.status not in {AccountStatus.BLOCKED, AccountStatus.DELETED} and session.get("session_version") == user.session_version:
         return user
     if user_id:
         session.clear()
@@ -164,6 +176,9 @@ def sign_in_user(user, remember=False):
     session["role"] = user.role.value
     session["session_version"] = user.session_version
     session["_csrf_token"] = secrets.token_urlsafe(32)
+    if user.role in {UserRole.ADMIN, UserRole.CO_ADMIN}:
+        session["privileged_until"] = time.time() + 1800
+        remember = False
     session.permanent = remember
     user.last_login_at = datetime.now(timezone.utc)
     db.session.commit()
@@ -193,6 +208,7 @@ def login_is_throttled(scope, identifier):
 def record_login_failure(scope, identifier):
     now = datetime.now(timezone.utc)
     key_hash = login_throttle_key(scope, identifier)
+    current_app.logger.warning('authentication_failure flow=%s identifier_digest=%s', scope.split('-', 1)[0], key_hash[:16])
     record = LoginThrottle.query.filter_by(key_hash=key_hash).first()
     if record is None:
         record = LoginThrottle(
@@ -240,7 +256,7 @@ def deliver_password_reset(user, reset_url):
         timeout=15,
     ) as smtp:
         if current_app.config["SMTP_USE_TLS"]:
-            smtp.starttls()
+            smtp.starttls(context=ssl.create_default_context())
         if current_app.config.get("SMTP_USERNAME"):
             smtp.login(
                 current_app.config["SMTP_USERNAME"],
@@ -325,6 +341,8 @@ def staff_required(view):
             or user.role not in {UserRole.ADMIN, UserRole.CO_ADMIN}
             or user.status != AccountStatus.APPROVED
         ):
+            if request.headers.get("X-Requested-With") == "fetch":
+                abort(403, description="Only authorized administrators can review or publish applications.")
             session.clear()
             flash("Sign in with an authorized review account to continue.", "error")
             return redirect(url_for("main.admin_login"))
@@ -517,13 +535,20 @@ def scan_apk_for_malware(path):
     """Fail closed unless ClamAV explicitly reports a clean APK."""
     command = current_app.config["CLAMAV_COMMAND"]
     timeout = current_app.config["CLAMAV_TIMEOUT_SECONDS"]
+    limiter = current_app.extensions['security_limits']
+    lease = limiter.acquire('malware-scans', 'global', 2, timeout + 30)
+    if not lease:
+        raise ValueError("Virus scanner is busy. Please retry shortly; the app was not submitted.")
     try:
         result = subprocess.run(  # nosec B603
-            [command, *CLAMAV_SCAN_OPTIONS, str(path)],
+            [command, *CLAMAV_SCAN_OPTIONS,
+             *(["--database=" + current_app.config["CLAMAV_DATABASE_DIR"]] if current_app.config.get("CLAMAV_DATABASE_DIR") else []), str(path)],
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
+            env={key: value for key, value in os.environ.items() if key.upper() in {
+                'PATH', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'LANG', 'LC_ALL', 'LD_LIBRARY_PATH'}},
             creationflags=subprocess.CREATE_NO_WINDOW
             if hasattr(subprocess, "CREATE_NO_WINDOW")
             else 0,
@@ -540,6 +565,8 @@ def scan_apk_for_malware(path):
         raise ValueError(
             "Virus scanning could not start. The app was not submitted."
         ) from error
+    finally:
+        limiter.release(lease)
 
     if result.returncode == 0:
         return (
@@ -553,16 +580,10 @@ def scan_apk_for_malware(path):
                 signatures.append(
                     line.rsplit(": ", 1)[-1].removesuffix(" FOUND")[:160]
                 )
-        current_app.logger.warning(
-            "ClamAV rejected an APK: %s", (result.stdout or "threat detected")[-1000:]
-        )
+        current_app.logger.warning("ClamAV rejected an APK; threat or scan-limit detected")
         finding = ", ".join(dict.fromkeys(signatures)) or "malware signature"
         raise ValueError(f"The APK was rejected: {finding} detected.")
-    current_app.logger.error(
-        "ClamAV scan error %s: %s",
-        result.returncode,
-        (result.stderr or result.stdout)[-1000:],
-    )
+    current_app.logger.error("ClamAV scan failed; exit code=%s", result.returncode)
     raise ValueError("Virus scanning failed. The app was not submitted.")
 
 
@@ -876,7 +897,9 @@ def validate_registration(form, role):
         errors.append(
             "Username must be 3–30 characters using letters, numbers, or underscores."
         )
-    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+    if username.casefold() == current_app.config["ADMIN_USERNAME"].casefold():
+        errors.append("That username is reserved. Choose another username.")
+    if len(email) > 120 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
         errors.append("Enter a valid email address.")
     if (
         len(password) < 12
@@ -890,6 +913,8 @@ def validate_registration(form, role):
         errors.append("Passwords do not match.")
     if role == UserRole.DEVELOPER and len(company_name) < 2:
         errors.append("Enter your developer or studio name.")
+    if len(company_name) > 120:
+        errors.append("Developer or studio name must contain at most 120 characters.")
     if security_question is None:
         errors.append("Choose a security question.")
     if not 4 <= len(security_answer) <= 200:
@@ -915,12 +940,13 @@ def validate_registration(form, role):
 @main.route("/")
 def home():
     approved_apps = (
-        StoreApp.query.filter_by(status=AppStatus.APPROVED)
+        StoreApp.query.options(joinedload(StoreApp.developer)).filter_by(status=AppStatus.APPROVED)
         .order_by(StoreApp.approved_at.desc(), StoreApp.id.desc())
-        .limit(6)
+        .limit(12)
         .all()
     )
-    return render_template("universe.html", approved_apps=approved_apps)
+    return render_template("universe.html", approved_apps=approved_apps,
+        categories=AppCategory, viewer=current_user())
 
 
 @main.get("/policies")
@@ -985,7 +1011,7 @@ def forgot_password():
             flash("Your session expired. Please try again.", "error")
             return redirect(url_for("main.forgot_password"))
         email = request.form.get("email", "").strip().lower()
-        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        if len(email) > 120 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
             flash("Enter a valid email address.", "error")
         else:
             throttled = login_is_throttled("password-reset", email)
@@ -994,7 +1020,7 @@ def forgot_password():
                 user = User.query.filter(
                     func.lower(User.email) == email,
                     User.role == UserRole(requested_role),
-                    User.status != AccountStatus.BLOCKED,
+                    User.status.notin_([AccountStatus.BLOCKED, AccountStatus.DELETED]),
                 ).first()
                 if user:
                     raw_token = issue_password_reset(user)
@@ -1100,9 +1126,16 @@ def manual_password_reset():
             not in {AccountStatus.BLOCKED, AccountStatus.DELETED}
         ):
             now = datetime.now(timezone.utc)
-            reset_request.status = ManualResetStatus.USED
-            reset_request.used_at = now
-            reset_request.code_hash = None
+            redeemed = ManualPasswordReset.query.filter(
+                ManualPasswordReset.id == reset_request.id,
+                ManualPasswordReset.status == ManualResetStatus.APPROVED,
+                ManualPasswordReset.code_hash == supplied_hash,
+                ManualPasswordReset.code_expires_at > now,
+            ).update({"status": ManualResetStatus.USED, "used_at": now, "code_hash": None}, synchronize_session=False)
+            if redeemed != 1:
+                db.session.rollback()
+                abort(400)
+            db.session.refresh(reset_request)
             if reset_request.reviewed_by:
                 record_admin_audit(
                     reset_request.reviewed_by,
@@ -1136,7 +1169,7 @@ def manual_password_reset():
 def reset_password(token):
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     reset_record = PasswordResetToken.query.filter_by(token_hash=token_hash).first()
-    if reset_record is None or not reset_record.is_valid:
+    if reset_record is None or not reset_record.is_valid or reset_record.user.status in {AccountStatus.BLOCKED, AccountStatus.DELETED}:
         return render_template(
             "password_recovery.html",
             mode="invalid",
@@ -1162,6 +1195,14 @@ def reset_password(token):
             flash("Passwords do not match.", "error")
         else:
             now = datetime.now(timezone.utc)
+            consumed = PasswordResetToken.query.filter(
+                PasswordResetToken.id == reset_record.id,
+                PasswordResetToken.used_at.is_(None),
+                PasswordResetToken.expires_at > now,
+            ).update({"used_at": now}, synchronize_session=False)
+            if consumed != 1:
+                db.session.rollback()
+                abort(400)
             reset_record.user.set_password(password)
             PasswordResetToken.query.filter_by(
                 user_id=reset_record.user_id,
@@ -1295,7 +1336,7 @@ def account_login(role_name):
         if not user or not password_matches:
             record_login_failure(f"{role.value}-login", identifier)
             flash("Incorrect email, username, or password.", "error")
-        elif user.status == AccountStatus.BLOCKED:
+        elif user.status in {AccountStatus.BLOCKED, AccountStatus.DELETED}:
             flash(
                 "This account has been blocked. Contact the marketplace administrator.",
                 "error",
@@ -1752,6 +1793,16 @@ def submit_app(user, app_id=None):
                 else []
             )
             if app_record is None:
+                # Serialize final slot allocation, not the expensive file scan.
+                owner = User.query.filter_by(id=user.id).with_for_update().populate_existing().one()
+                allowed = owner.status == AccountStatus.APPROVED and StoreApp.query.filter_by(developer_id=owner.id).count() < developer_app_limit(owner)
+                if not allowed:
+                    db.session.rollback()
+                    safe_delete_upload("app_icons", icon_file)
+                    safe_delete_upload("apks", apk_file)
+                    for screenshot in new_screenshots:
+                        safe_delete_upload("app_screenshots", screenshot["file_name"])
+                    abort(409, description="Developer approval or upload allowance changed. Review your dashboard before submitting again.")
                 app_record = StoreApp(developer=user, slug=unique_app_slug(name))
                 db.session.add(app_record)
             app_record.name = name
@@ -2234,7 +2285,7 @@ def app_icon(app_id):
         abort(404)
     viewer = current_user()
     can_view = app_record.status == AppStatus.APPROVED or (
-        viewer
+        viewer and viewer.status == AccountStatus.APPROVED
         and (
             viewer.role in {UserRole.ADMIN, UserRole.CO_ADMIN}
             or viewer.id == app_record.developer_id
@@ -2256,7 +2307,7 @@ def app_screenshot(screenshot_id):
         abort(404)
     viewer = current_user()
     can_view = screenshot.app.status == AppStatus.APPROVED or (
-        viewer
+        viewer and viewer.status == AccountStatus.APPROVED
         and (
             viewer.role in {UserRole.ADMIN, UserRole.CO_ADMIN}
             or viewer.id == screenshot.app.developer_id
@@ -2856,6 +2907,8 @@ def admin_apps(admin):
             "rejected": SubmissionStatus.ADMIN_REJECTED,
         }
         apps_query = apps_query.filter(StoreApp.submission_status == workflow_filters[status_value])
+        if status_value == "published":
+            apps_query = apps_query.filter(StoreApp.status == AppStatus.APPROVED)
     if query_text:
         search = f"%{escaped_search_term(query_text)}%"
         apps_query = apps_query.join(User, StoreApp.developer_id == User.id).filter(
@@ -2945,8 +2998,10 @@ def submission_status_snapshot():
         view = submission_view(app_record)
         items.append({"id": app_record.id, "revision": app_record.submission_revision,
             "label": view["label"], "security": view["security"], "admin": view["admin"],
-            "publishing": view["publishing"],
+            "publishing": view["publishing"], "scan_running": view["scan_running"],
             "html": render_template("_submission_progress.html", app_record=app_record),
+            "actions": render_template("_submission_developer_actions.html", app_record=app_record)
+                if user.role == UserRole.DEVELOPER else None,
             "panel": render_template("_submission_panel.html", app_record=app_record,
                 admin=user if user.role in {UserRole.ADMIN, UserRole.CO_ADMIN} else None,
                 csrf_token=get_csrf_token()) if request.args.get("details") == "1" else None})
@@ -3013,7 +3068,9 @@ def scan_app(admin, app_id):
             malware_status = SecurityScanStatus.PASSED
         except ValueError as error:
             malware_summary = str(error)
-    except (OSError, ValueError, zipfile.BadZipFile) as error:
+    except OSError:
+        structural_summary = "The APK could not be read securely. Ask an administrator to check private storage."
+    except (ValueError, zipfile.BadZipFile) as error:
         structural_summary = str(error) or "Invalid application package."
     # Reload under lock so edits/download counters during the scan are not overwritten.
     app_record = StoreApp.query.filter_by(id=app_id).with_for_update().populate_existing().first()
@@ -3204,6 +3261,8 @@ def perform_submission_action(admin, app_id, action):
             if not deep_scan_passed(getattr(app_record, prefix + "security_scan_summary")) or getattr(app_record, prefix + "malware_scan_status") != SecurityScanStatus.PASSED:
                 raise ValueError("Run the administrator security scan; both static and malware checks must pass.")
             filename = getattr(app_record, prefix + "apk_file")
+            if not filename or not getattr(app_record, prefix + "apk_sha256"):
+                raise ValueError("The build is missing its file or checksum. Resubmit and scan it again.")
             path = private_upload_folder("apks") / filename
             digest = None
             if path.is_file() and Path(filename).name == filename:
@@ -3364,29 +3423,53 @@ def manage_app(admin, app_id, action):
 
 
 def server_event_response(event_filter):
-    subscriber = account_events.subscribe()
+    stream_user = current_user()
+    initial_role = stream_user.role if stream_user else None
+    limiter = current_app.extensions['security_limits']
+    lease = limiter.acquire('event-streams', str(stream_user.id) if stream_user else 'anonymous', 5, 630)
+    if not lease:
+        abort(429)
+    try:
+        subscriber = account_events.subscribe()
+    except Exception:
+        limiter.release(lease)
+        raise
 
     @stream_with_context
     def generate():
-        yield "retry: 2500\n\n"
+        deadline = time.monotonic() + 600
         try:
-            while True:
+            yield "retry: 2500\n\n"
+            while time.monotonic() < deadline:
+                db.session.expire_all()
+                live_user = current_user()
+                allowed = bool(live_user and live_user.role == initial_role)
+                db.session.remove()  # No database connection held during idle streaming.
+                if not allowed:
+                    return
                 try:
                     event = subscriber.get(timeout=15)
                 except Empty:
                     yield ": keep-alive\n\n"
                     continue
+                db.session.expire_all()
+                live_user = current_user()
+                allowed = bool(live_user and live_user.role == initial_role)
+                db.session.remove()
+                if not allowed:
+                    return
                 if event_filter(event):
                     yield f"id: {event['event_id']}\n"
                     yield "event: account-change\n"
                     yield f"data: {json.dumps(event)}\n\n"
         finally:
             account_events.unsubscribe(subscriber)
+            limiter.release(lease)
 
     return Response(
         generate(),
         mimetype="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={"Cache-Control": "private, no-store", "X-Accel-Buffering": "no"},
     )
 
 
@@ -3394,7 +3477,8 @@ def server_event_response(event_filter):
 @staff_required
 def admin_account_events(admin):
     return server_event_response(
-        lambda event: event.get("type", "").startswith("account_")
+        lambda event: event.get("type", "").startswith("account_") and (
+            admin.role == UserRole.ADMIN or event.get("role") == UserRole.DEVELOPER.value)
     )
 
 
@@ -3674,6 +3758,8 @@ def account_settings():
         except ValueError:
             security_question = None
         errors = []
+        if email != user.email and not user.check_password(current_password):
+            errors.append("Enter your current password to change your email address.")
         if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
             errors.append("Enter a valid email address.")
         elif User.query.filter(
@@ -3682,6 +3768,8 @@ def account_settings():
             errors.append("That email address is already in use.")
         if user.role == UserRole.DEVELOPER and not company_name:
             errors.append("Enter your developer or company name.")
+        if len(company_name) > 120:
+            errors.append("Developer or company name must contain at most 120 characters.")
         if new_password or confirm_password:
             if not user.check_password(current_password):
                 errors.append("Your current password is incorrect.")
@@ -3894,6 +3982,9 @@ def logout():
             cancel_url=dashboard_url_for(user) if user else url_for("main.home"),
             csrf_token=get_csrf_token(),
         )
+    if user:
+        User.query.filter_by(id=user.id).update({"session_version": User.session_version + 1})
+        db.session.commit()
     session.clear()
     flash("You have been signed out safely.", "success")
     return redirect(url_for("main.home"))

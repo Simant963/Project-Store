@@ -8,6 +8,14 @@ branch_labels = depends_on = None
 
 
 def upgrade():
+    # PostgreSQL already named this legacy constraint automatically; SQLite did not.
+    # Preserve uniqueness and align the name so schema checks work on both backends.
+    if op.get_bind().dialect.name == "sqlite":
+        with op.batch_alter_table("manual_password_reset", naming_convention={
+            "uq": "manual_password_reset_reference_key"
+        }) as batch:
+            batch.drop_constraint("manual_password_reset_reference_key", type_="unique")
+            batch.create_unique_constraint("manual_password_reset_reference_key", ["reference"])
     with op.batch_alter_table("store_app") as batch:
         batch.add_column(sa.Column("submission_status", sa.String(30), nullable=False, server_default="SECURITY_CHECK_PENDING"))
         batch.add_column(sa.Column("submission_revision", sa.Integer(), nullable=False, server_default="1"))

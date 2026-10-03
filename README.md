@@ -64,7 +64,7 @@ migrations, Docker, or the Compose configuration are not ready.
 
 ## Verification
 
-Local test scripts, saved test credentials, and generated verification reports
+Earlier local test scripts, saved test credentials, and generated verification reports
 have been removed from this repository. Before launch, verify registration,
 login, password recovery, developer/app approvals, uploads, downloads, role
 permissions, malware rejection, and backup recovery in a separate staging
@@ -72,6 +72,44 @@ environment. Check `/health` and `/ready` after every deployment.
 
 Keep private environment files, runtime data, backups, and installed
 dependencies out of Git. Only placeholder environment examples are committed.
+
+## App submission progress
+
+Developer My Apps and the administrator overview/review queue share a four-stage
+tracker: uploaded, security checks, admin verification, and published/live.
+Developers can open `/developer/apps/<id>` for private progress, feedback, and
+status history. Administrators use the existing `/admin/apps` queue and detail
+pages; authorized co-admin reviewers use the same controls.
+
+Uploads retain the existing fail-closed structural and ClamAV checks. The deeper
+60-point check is queued for the administrator's **Run security check** action.
+A successful scan moves the submission to admin review automatically. **Approve
+App** verifies the build but does not make it downloadable. **Publish App** is a
+separate confirmed action. Rejection and requested changes require a reason.
+Resubmission restarts security review; the previous published version stays live
+while a replacement is reviewed. Published builds cannot be rescanned through
+this workflow; submit a new version instead.
+
+Review states are enforced on the backend, with transactional notifications,
+per-build transition history, row locking, optimistic revision checks, and
+idempotent approval/publication. The read-only `/submission-status?ids=1,2`
+snapshot and `/apps/<id>/status-history` enforce submission ownership or staff
+access. Existing SSE streams refresh visible progress, with a 15-second polling
+fallback; status updates never require a manual page reload.
+
+The isolated verification runner creates disposable accounts and storage, applies
+all migrations, and checks both roles without accessing the configured database:
+
+```text
+env/Scripts/python.exe verification/submission_workflow_checks.py
+```
+
+This default run uses real static analysis and a mocked antivirus result. Its
+`--postgres --real-antivirus` mode requires a disposable Docker database named
+`appora_submission` on host `appora-submission-db`, the private fixture connection
+in `APPORA_VERIFY_DATABASE_URL`, and a real ClamAV signature volume. Never point
+verification tools at production. No clean scan guarantees an APK is safe;
+review warnings and perform isolated Android installation/runtime testing.
 
 ## Database migrations
 

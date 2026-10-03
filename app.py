@@ -6,7 +6,7 @@ from pathlib import Path
 
 import click
 from dotenv import load_dotenv
-from flask import Flask, abort, g, jsonify, render_template, request, session
+from flask import Flask, abort, g, jsonify, make_response, render_template, request, session
 from urllib.parse import urlparse
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
@@ -97,6 +97,7 @@ def create_app():
     app.config["APP_SCREENSHOT_MAX_BYTES"] = 8 * 1024 * 1024
     app.config["APK_MAX_BYTES"] = 200 * 1024 * 1024
     app.config["CLAMAV_COMMAND"] = os.getenv("CLAMAV_COMMAND", "clamscan")
+    app.config["CLAMAV_DATABASE_DIR"] = os.getenv("CLAMAV_DATABASE_DIR", "")
     app.config["CLAMAV_TIMEOUT_SECONDS"] = int(
         os.getenv("CLAMAV_TIMEOUT_SECONDS", "180")
     )
@@ -163,6 +164,8 @@ def create_app():
                 "PASSWORD_RESET_MODE must be either manual or email"
             )
         if app.config["PASSWORD_RESET_MODE"] == "email":
+            if not app.config["SMTP_USE_TLS"]:
+                configuration_errors.append("SMTP_USE_TLS must be enabled for production password email")
             if not app.config["SMTP_HOST"]:
                 configuration_errors.append(
                     "SMTP_HOST is required when PASSWORD_RESET_MODE=email"
@@ -191,6 +194,10 @@ def create_app():
             configuration_errors.append(
                 "CLAMAV_COMMAND must resolve to an installed ClamAV scanner"
             )
+        else:
+            from application.security_controls import supported_scanner
+            if not supported_scanner(clamav_command):
+                configuration_errors.append("ClamAV must use a supported security release (1.4.6+ LTS or 1.5.4+)")
         admin_password = app.config["ADMIN_PASSWORD"] or ""
         if len(admin_password) < 12 or admin_password.startswith("replace-"):
             configuration_errors.append(
@@ -225,6 +232,13 @@ def create_app():
     def stale_submission(error):
         db.session.rollback()
         return jsonify({"ok": False, "message": "Another request changed this application. Refresh and try again."}), 409
+
+    @app.errorhandler(409)
+    def conflicting_submission(error):
+        if request.headers.get("X-Requested-With") == "fetch":
+            return jsonify({"ok": False, "message": error.description}), 409
+        return render_safe_error(409, "Submission changed", error.description,
+                                 "bi-arrow-repeat")
 
     @app.after_request
     def apply_security_headers(response):
@@ -407,14 +421,14 @@ def create_app():
 
     @app.errorhandler(429)
     def rate_limit_error(error):
-        response, status = render_safe_error(
+        response = make_response(render_safe_error(
             429,
             "Too many requests",
             "Please wait a few minutes before trying again.",
             "bi-hourglass-split",
-        )
+        ))
         response.headers["Retry-After"] = "900"
-        return response, status
+        return response
 
     @app.errorhandler(Exception)
     def internal_error(error):
@@ -443,6 +457,8 @@ def create_app():
     from application.controllers import main
 
     app.register_blueprint(main)
+    from application.security_controls import install_request_controls
+    install_request_controls(app)
 
     @app.cli.command("production-check")
     def production_check():
@@ -479,32 +495,10 @@ def create_app():
         head_revision = ScriptDirectory.from_config(migration_config).get_current_head()
         if current_revision != head_revision:
             return app
-        admin_password = app.config["ADMIN_PASSWORD"]
-        admin = User.query.filter_by(username=app.config["ADMIN_USERNAME"]).first()
-        if admin is None and admin_password:
-            admin = User(
-                username=app.config["ADMIN_USERNAME"],
-                email=app.config["ADMIN_EMAIL"],
-                role=UserRole.ADMIN,
-                status=AccountStatus.APPROVED,
-            )
-            admin.set_password(admin_password)
-            admin.approve()
-            db.session.add(admin)
-            try:
-                db.session.commit()
-            except IntegrityError:
-                db.session.rollback()
-                if not User.query.filter_by(
-                    username=app.config["ADMIN_USERNAME"]
-                ).first():
-                    raise
-        elif admin is not None:
-            admin.role = UserRole.ADMIN
-            admin.status = AccountStatus.APPROVED
-            if not admin.email:
-                admin.email = app.config["ADMIN_EMAIL"]
-            db.session.commit()
+        from application.security_controls import bootstrap_administrator
+        bootstrap_administrator(app.config["ADMIN_USERNAME"], app.config["ADMIN_EMAIL"],
+                                app.config["ADMIN_PASSWORD"])
+
 
         username_index.rebuild(User.query.order_by(User.id).all())
 

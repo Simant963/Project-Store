@@ -32,6 +32,7 @@ services:
     env_file: .env.production
     environment:
       REDIS_URL: redis://redis:6379/0
+      CLAMAV_COMMAND: /usr/local/bin/clamscan
     command: ["flask", "--app", "app", "db", "upgrade"]
     depends_on:
       init-storage:
@@ -47,6 +48,7 @@ services:
     env_file: .env.production
     environment:
       REDIS_URL: redis://redis:6379/0
+      CLAMAV_COMMAND: /usr/local/bin/clamscan
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -77,7 +79,7 @@ services:
       - monitor_data:/data/monitor
 
   proxy:
-    image: nginx:1.27-alpine
+    image: nginx:1.30.5-alpine
     restart: unless-stopped
     depends_on:
       web:

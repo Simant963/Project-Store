@@ -19,3 +19,9 @@ _*test.py
 _*test.cjs
 package-lock.json
 design-system
+verification
+reports
+deployment/certs/*
+!deployment/certs/.gitkeep
+*.pem
+*.key

@@ -27,8 +27,11 @@
                 data.items.forEach(item => {
                     const panel = document.querySelector(`[data-submission-panel="${item.id}"]`);
                     const node = document.querySelector(`[data-submission-progress="${item.id}"]`);
-                    if (panel && item.panel && panel.dataset.revision !== String(item.revision)) panel.outerHTML = item.panel;
+                    const changed = node && node.dataset.revision !== String(item.revision);
+                    if (panel && item.panel && (panel.dataset.revision !== String(item.revision) || panel.dataset.scanRunning !== (item.scan_running ? '1' : '0'))) panel.outerHTML = item.panel;
                     else if (node && node.dataset.revision !== String(item.revision)) node.outerHTML = item.html;
+                    const actions = document.querySelector(`[data-submission-developer-actions="${item.id}"]`);
+                    if (changed && actions && item.actions) actions.innerHTML = item.actions;
                     ['label','security','admin','publishing'].forEach(field => document.querySelectorAll(`[data-submission-${field}="${item.id}"]`).forEach(label => { label.textContent = item[field]; }));
                 });
             }
@@ -58,6 +61,7 @@
         const button = form.querySelector('button[type="submit"]');
         const original = button.textContent; button.disabled = true; button.textContent = 'Processing…'; actionBusy = true;
         announce('Updating submission…');
+        let failureMessage = null;
         try {
             const response = await fetch(form.action, { method:'POST', body:new FormData(form), credentials:'same-origin', headers:{'X-Requested-With':'fetch'} });
             if (!response.ok) {
@@ -68,10 +72,12 @@
             // Scanning has an existing server-rendered report; navigate after completion.
             if (form.action.endsWith('/scan')) { location.assign(response.url); return; }
             announce('Submission updated successfully.');
-        } catch (error) { announce(error.message + ' Your data has not been lost.'); }
+            if (form.hasAttribute('data-reload-after')) { location.reload(); return; }
+        } catch (error) { failureMessage = error.message; }
         finally { actionBusy = false; button.disabled = false; button.textContent = original; }
         document.activeElement?.blur();
         await refresh();
+        if (failureMessage) announce(failureMessage + ' Latest saved status has been checked; retry if needed.');
     });
     if (root.dataset.submissionEvents && window.EventSource) {
         const events = new EventSource(root.dataset.submissionEvents);

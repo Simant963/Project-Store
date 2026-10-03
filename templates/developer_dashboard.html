@@ -18,19 +18,11 @@
                     <span class="submission-status" data-submission-label="{{ app.id }}">{{ submission_view(app).label }}</span>
                     <span class="developer-downloads"><i class="bi bi-download"></i>{{ app.download_count }} <small><i class="bi bi-star-fill"></i>{{ app.average_rating or '—' }}</small></span>
                     <span class="developer-submitted">{{ app.submitted_at.strftime('%d %b %Y') }}</span>
-                    {% if app.status.value == 'approved' %}
-                        <div class="developer-row-actions">
-                            <a class="review-button" href="{{ url_for('main.app_detail', slug=app.slug) }}">Store <i class="bi bi-arrow-up-right"></i></a>
-                            {% if app.pending_release_status and app.pending_release_status.value == 'pending' %}<span class="release-wait">v{{ app.pending_version }} in review</span>
-                            {% elif app.pending_release_status and app.pending_release_status.value == 'rejected' %}<a class="review-button resubmit" href="{{ url_for('main.submit_app_version', app_id=app.id) }}">Fix v{{ app.pending_version }}</a>
-                            {% else %}<a class="review-button release" href="{{ url_for('main.submit_app_version', app_id=app.id) }}">New version <i class="bi bi-plus"></i></a>{% endif %}
-                        </div>
-                    {% elif app.status.value == 'rejected' %}<a class="review-button resubmit" href="{{ url_for('main.submit_app', app_id=app.id) }}">Fix &amp; resubmit <i class="bi bi-pencil-square"></i></a>
-                    {% else %}<span class="review-wait">{{ app.review_note or 'Waiting for review' }}</span>{% endif %}
-                </article><div class="submission-panel"><a class="review-button" href="{{ url_for('main.developer_app_submission', app_id=app.id) }}">View details <i class="bi bi-arrow-right" aria-hidden="true"></i></a>{% set app_record = app %}{% include '_submission_progress.html' %}</div>{% endfor %}
+                    <div class="developer-row-actions" data-submission-developer-actions="{{ app.id }}">{% set app_record = app %}{% include '_submission_developer_actions.html' %}</div>
+                </article><div class="submission-panel">{% set app_record = app %}{% include '_submission_progress.html' %}</div>{% endfor %}
             </div>
         </section>
         {% else %}<section class="empty-library developer-empty"><span><i class="bi bi-window-plus"></i></span><h2>{{ 'Publish your first app' if app_limit else 'App uploads are currently disabled' }}</h2><p>{{ 'Add your store details, app icon, release information, privacy link, and APK. The administrator reviews everything before it goes live.' if app_limit else 'Contact an administrator if you need an app upload slot.' }}</p>{% if app_limit %}<a class="btn btn-dark rounded-pill px-4" href="{{ url_for('main.submit_app') }}">Start an app submission</a>{% endif %}</section>{% endif %}
     <p class="submission-connection" role="status" data-submission-connection>Connecting to live updates…</p></main>
-    <script nonce="{{ csp_nonce }}">const accountStream=new EventSource('{{ url_for("main.my_account_events") }}');accountStream.addEventListener('account-change',(event)=>{const update=JSON.parse(event.data);if(update.type?.startsWith('account_') && ['blocked','rejected','deleted'].includes(update.status))window.location.assign(`{{ url_for('main.account_access_changed') }}?state=${encodeURIComponent(update.status)}`)});/* const appStream=new EventSource('{{ url_for("main.developer_app_events") }}');appStream.addEventListener('account-change',()=>window.location.reload()); */</script>
+    <script nonce="{{ csp_nonce }}">const accountStream=new EventSource('{{ url_for("main.my_account_events") }}');accountStream.addEventListener('account-change',(event)=>{const update=JSON.parse(event.data);if(update.type?.startsWith('account_') && ['blocked','rejected','deleted'].includes(update.status))window.location.assign(`{{ url_for('main.account_access_changed') }}?state=${encodeURIComponent(update.status)}`)});</script>
 </body></html>
